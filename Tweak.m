@@ -2,12 +2,160 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <xpc/xpc.h>
+#include <errno.h>
+#include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "kexploit/kexploit_opa334.h"
 #include "kexploit/kutils.h"
 #include "sandbox_escape.h"
 #include "apfs_own.h"
+
+static const char *kCarrierBundlesPath = "/var/mobile/Library/Carrier Bundles";
+static const NSInteger kCarrierBundlesLockButtonTag = 0x43424C4B;
+
+static UIWindow *carrierBundlesKeyWindow(void) {
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (scene.activationState != UISceneActivationStateForegroundActive ||
+            ![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (window.isKeyWindow) return window;
+        }
+    }
+    return nil;
+}
+
+static void showCarrierBundlesLockedAlert(mode_t mode) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *keyWindow = carrierBundlesKeyWindow();
+        UIViewController *presenter = keyWindow.rootViewController;
+        while (presenter.presentedViewController) presenter = presenter.presentedViewController;
+        if (!presenter) {
+            NSLog(@"[CarrierBundles] 0555 verified, but no presenter was available");
+            return;
+        }
+
+        NSString *message = [NSString stringWithFormat:
+            @"/var/mobile/Library/Carrier Bundles\n权限已改为 0%o，现在不可写入。\n\n点“完成并退出”结束本次运行。",
+            mode & 0777];
+        UIAlertController *alert = [UIAlertController
+            alertControllerWithTitle:@"Carrier Bundles 已锁定"
+            message:message
+            preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction
+            actionWithTitle:@"完成并退出"
+            style:UIAlertActionStyleDefault
+            handler:^(__unused UIAlertAction *action) { _exit(0); }]];
+        [presenter presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+static void showCarrierBundlesWritableAlert(mode_t mode) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *keyWindow = carrierBundlesKeyWindow();
+        UIViewController *presenter = keyWindow.rootViewController;
+        while (presenter.presentedViewController) presenter = presenter.presentedViewController;
+        if (!presenter) {
+            NSLog(@"[CarrierBundles] 0777 verified, but no presenter was available");
+            return;
+        }
+
+        NSString *message = [NSString stringWithFormat:
+            @"/var/mobile/Library/Carrier Bundles\n当前权限为 0%o，可以开始写入。\n\n全部完成后，请点右下角红色锁定按钮。",
+            mode & 0777];
+        UIAlertController *alert = [UIAlertController
+            alertControllerWithTitle:@"Carrier Bundles 已可写"
+            message:message
+            preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"开始操作"
+            style:UIAlertActionStyleDefault handler:nil]];
+        [presenter presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+static int setCarrierBundlesDirectoryPermissions(mode_t permissions) {
+    struct stat before;
+    if (stat(kCarrierBundlesPath, &before) != 0) {
+        NSLog(@"[CarrierBundles] stat before failed: %s", strerror(errno));
+        return -1;
+    }
+    if (!S_ISDIR(before.st_mode)) {
+        NSLog(@"[CarrierBundles] target is not a directory (mode=0%o)", before.st_mode & 0xFFFF);
+        return -1;
+    }
+
+    mode_t requested = (before.st_mode & S_IFMT) | (permissions & 0777);
+    NSLog(@"[CarrierBundles] mode before=0%o requested=0%o",
+          before.st_mode & 0xFFFF, requested & 0xFFFF);
+    if (apfs_mod(kCarrierBundlesPath, requested) != 0) {
+        NSLog(@"[CarrierBundles] apfs_mod failed");
+        return -1;
+    }
+
+    struct stat after;
+    if (stat(kCarrierBundlesPath, &after) != 0) {
+        NSLog(@"[CarrierBundles] stat after failed: %s", strerror(errno));
+        return -1;
+    }
+    if (!S_ISDIR(after.st_mode) || (after.st_mode & 0777) != (permissions & 0777)) {
+        NSLog(@"[CarrierBundles] verification failed (mode=0%o)", after.st_mode & 0xFFFF);
+        return -1;
+    }
+
+    NSLog(@"[CarrierBundles] directory mode changed successfully: 0%o -> 0%o",
+          before.st_mode & 0xFFFF, after.st_mode & 0xFFFF);
+    return 0;
+}
+
+int prepareCarrierBundlesDirectoryForWrite(void) {
+    return setCarrierBundlesDirectoryPermissions(0777);
+}
+
+int lockCarrierBundlesDirectoryReadOnly(void) {
+    int result = setCarrierBundlesDirectoryPermissions(0555);
+    if (result == 0) {
+        struct stat after;
+        if (stat(kCarrierBundlesPath, &after) == 0) showCarrierBundlesLockedAlert(after.st_mode);
+    }
+    return result;
+}
+
+static void installCarrierBundlesLockButton(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = carrierBundlesKeyWindow();
+        if (!window || [window viewWithTag:kCarrierBundlesLockButtonTag]) return;
+
+        UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+        button.tag = kCarrierBundlesLockButtonTag;
+        button.translatesAutoresizingMaskIntoConstraints = NO;
+        button.backgroundColor = [UIColor colorWithRed:0.78 green:0.10 blue:0.12 alpha:0.94];
+        button.tintColor = UIColor.whiteColor;
+        button.contentEdgeInsets = UIEdgeInsetsMake(10, 14, 10, 14);
+        [button setTitle:@"锁定 Carrier Bundles" forState:UIControlStateNormal];
+
+        UIAction *action = [UIAction actionWithHandler:^(__unused UIAction *action) {
+            button.enabled = NO;
+            [button setTitle:@"正在锁定…" forState:UIControlStateNormal];
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                if (lockCarrierBundlesDirectoryReadOnly() != 0) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        button.enabled = YES;
+                        [button setTitle:@"锁定失败，点此重试" forState:UIControlStateNormal];
+                    });
+                }
+            });
+        }];
+        [button addAction:action forControlEvents:UIControlEventTouchUpInside];
+        [window addSubview:button];
+        UILayoutGuide *safe = window.safeAreaLayoutGuide;
+        [NSLayoutConstraint activateConstraints:@[
+            [button.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+            [button.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-12]
+        ]];
+        NSLog(@"[CarrierBundles] lock button installed");
+    });
+}
 
 #pragma mark - Root Helper Hooks
 
@@ -483,13 +631,11 @@ static void hook_activationViewDidLoad(id self, SEL _cmd) {
 
 #pragma mark - Auto-repair protected roots on navigate
 
-// Lazy, per-root permission repair: when Filza lists any path inside a
-// protected root, fix that root once in the background. App bundles keep the
-// original owner-only repair; Carrier Bundles also gets owner read/write bits
-// so edits and permission changes can be saved from Filza as mobile.
+// App bundles keep the original lazy ownership repair. Carrier Bundles is
+// handled separately: navigation may start the delayed exploit, but it never
+// recursively changes ownership or permissions.
 
 static NSString * const kCarrierBundlesRoot = @"/var/mobile/Library/Carrier Bundles";
-static NSString * const kCarrierSavedPermissionsKey = @"FilzaCarrierBundlesSavedPermissions";
 
 static NSMutableSet<NSString *> *g_chowned_roots = nil;
 static dispatch_queue_t g_chown_queue = NULL;
@@ -509,51 +655,6 @@ static NSString *normalized_path(NSString *path) {
 static BOOL path_is_at_or_inside_root(NSString *path, NSString *root) {
     if ([path isEqualToString:root]) return YES;
     return [path hasPrefix:[root stringByAppendingString:@"/"]];
-}
-
-static void remember_carrier_permission(NSString *path, mode_t mode) {
-    NSString *normalized = normalized_path(path);
-    if (!path_is_at_or_inside_root(normalized, kCarrierBundlesRoot)) return;
-
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSMutableDictionary *saved = [[defaults dictionaryForKey:kCarrierSavedPermissionsKey] mutableCopy];
-    if (!saved) saved = [NSMutableDictionary new];
-
-    [saved setObject:@((unsigned int)(mode & 07777)) forKey:normalized];
-    [defaults setObject:saved forKey:kCarrierSavedPermissionsKey];
-    [defaults synchronize];
-}
-
-static void replay_saved_carrier_permissions(void) {
-    NSDictionary *saved = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kCarrierSavedPermissionsKey];
-    if (![saved isKindOfClass:[NSDictionary class]] || saved.count == 0) return;
-
-    NSArray<NSString *> *paths = [[saved allKeys] sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
-        if (a.length < b.length) return NSOrderedAscending;
-        if (a.length > b.length) return NSOrderedDescending;
-        return [a compare:b];
-    }];
-
-    NSUInteger applied = 0;
-    for (NSString *path in paths) {
-        if (![path isKindOfClass:[NSString class]] ||
-            !path_is_at_or_inside_root(normalized_path(path), kCarrierBundlesRoot)) {
-            continue;
-        }
-
-        NSNumber *perm = [saved objectForKey:path];
-        if (![perm isKindOfClass:[NSNumber class]]) continue;
-
-        const char *cpath = [path fileSystemRepresentation];
-        struct stat st;
-        if (lstat(cpath, &st) != 0 || S_ISLNK(st.st_mode)) continue;
-
-        apfs_own(cpath, 501, 501);
-        mode_t target = (st.st_mode & S_IFMT) | ([perm unsignedShortValue] & 07777);
-        if (apfs_mod(cpath, target) == 0) applied++;
-    }
-
-    NSLog(@"[Tweak] replayed %lu saved Carrier Bundles permissions", (unsigned long)applied);
 }
 
 // Returns the .app root path for any path inside a Bundle/Application/<UUID>/<Name>.app,
@@ -581,10 +682,11 @@ static NSString *protected_root_for_path(NSString *path) {
 static void ensure_protected_root_repaired_async(NSString *path) {
     NSString *root = protected_root_for_path(path);
     if (!root) return;
+    if ([root isEqualToString:kCarrierBundlesRoot]) {
+        if (!g_sandbox_escaped) scheduleExploitOnce();
+        return;
+    }
     if (!g_sandbox_escaped) {
-        if ([root isEqualToString:kCarrierBundlesRoot]) {
-            scheduleExploitOnce();
-        }
         NSLog(@"[Tweak] auto-repair skipped before sandbox escape: %@", root);
         return;
     }
@@ -595,14 +697,8 @@ static void ensure_protected_root_repaired_async(NSString *path) {
     }
 
     dispatch_async(g_chown_queue, ^{
-        if ([root isEqualToString:kCarrierBundlesRoot]) {
-            NSLog(@"[Tweak] auto-mobile-rw: %@", root);
-            apfs_mobile_rw_tree([root UTF8String], 501, 501);
-            replay_saved_carrier_permissions();
-        } else {
-            NSLog(@"[Tweak] auto-chown: %@", root);
-            apfs_own_tree([root UTF8String], 501, 501);
-        }
+        NSLog(@"[Tweak] auto-chown: %@", root);
+        apfs_own_tree([root UTF8String], 501, 501);
     });
 }
 
@@ -612,48 +708,6 @@ static id hook_contentsOfDirectory(id self, SEL _cmd, id path, NSError **error) 
         ensure_protected_root_repaired_async((NSString *)path);
     }
     return ((id(*)(id,SEL,id,NSError**))orig_contentsOfDirectory)(self, _cmd, path, error);
-}
-
-static IMP orig_setAttributesOfItem = NULL;
-static BOOL hook_setAttributesOfItem(id self, SEL _cmd, id attributes, id path, NSError **error) {
-    BOOL isCarrierPermissionChange = NO;
-    NSNumber *perm = nil;
-    NSString *normalized = nil;
-    if ([path isKindOfClass:[NSString class]] &&
-        [attributes isKindOfClass:[NSDictionary class]]) {
-        normalized = normalized_path((NSString *)path);
-        perm = [(NSDictionary *)attributes objectForKey:NSFilePosixPermissions];
-        isCarrierPermissionChange = (perm &&
-            path_is_at_or_inside_root(normalized, kCarrierBundlesRoot));
-    }
-
-    BOOL ok = orig_setAttributesOfItem ?
-        ((BOOL(*)(id,SEL,id,id,NSError**))orig_setAttributesOfItem)(self, _cmd, attributes, path, error) :
-        NO;
-    if (ok) {
-        if (isCarrierPermissionChange) {
-            remember_carrier_permission(normalized, [perm unsignedShortValue]);
-        }
-        return YES;
-    }
-    if (!g_sandbox_escaped ||
-        !isCarrierPermissionChange) {
-        return ok;
-    }
-
-    const char *cpath = [(NSString *)path fileSystemRepresentation];
-    struct stat st;
-    if (lstat(cpath, &st) != 0 || S_ISLNK(st.st_mode)) return ok;
-
-    apfs_own(cpath, 501, 501);
-    mode_t target = (st.st_mode & S_IFMT) | ([perm unsignedShortValue] & 07777);
-    if (apfs_mod(cpath, target) == 0) {
-        remember_carrier_permission(normalized, [perm unsignedShortValue]);
-        if (error) *error = nil;
-        NSLog(@"[Tweak] saved permissions via apfs_mod: %@ -> 0%o", path, target & 0xFFFF);
-        return YES;
-    }
-    return ok;
 }
 
 #pragma mark - Hook Installation
@@ -683,14 +737,6 @@ static void installHooks(void) {
         if (cod) {
             orig_contentsOfDirectory = method_getImplementation(cod);
             method_setImplementation(cod, (IMP)hook_contentsOfDirectory);
-        }
-    }
-    Class nsfm = [NSFileManager class];
-    if (nsfm) {
-        Method m = class_getInstanceMethod(nsfm, @selector(setAttributes:ofItemAtPath:error:));
-        if (m) {
-            orig_setAttributesOfItem = method_getImplementation(m);
-            method_setImplementation(m, (IMP)hook_setAttributesOfItem);
         }
     }
     Class zipper = NSClassFromString(@"Zipper");
@@ -759,19 +805,29 @@ static void runExploit(void) {
     uint64_t self_proc_addr = proc_self();
     int sret = sandbox_escape(self_proc_addr);
     NSLog(@"[Tweak] sandbox_escape returned %d", sret);
-    if (sret == 0) {
-        g_sandbox_escaped = YES;
+    if (sret != 0) {
+        NSLog(@"[CarrierBundles] skipped because sandbox escape failed");
+        return;
+    }
+    g_sandbox_escaped = YES;
+
+    if (prepareCarrierBundlesDirectoryForWrite() != 0) {
+        NSLog(@"[CarrierBundles] could not prepare 0777; lock control was not installed");
+        return;
+    }
+
+    struct stat writableState;
+    if (stat(kCarrierBundlesPath, &writableState) == 0) {
+        installCarrierBundlesLockButton();
+        showCarrierBundlesWritableAlert(writableState.st_mode);
     }
 
     // For root-owned paths that fail DAC, use apfs_own(path, 501, 501) to
     // flip on-disk ownership to mobile before opening. Example:
     //     if (apfs_own("/var/root/.somefile", 501, 501) == 0) { ... }
 
-    // Auto-repair runs lazily via the contentsOfDirectoryAtPath: hook: the
-    // first time Filza lists anything inside a protected root, the ownership
-    // and permission repair fires in the background. Covered roots:
-    //   /var/containers/Bundle/Application/<UUID>/<Name>.app
-    //   /var/mobile/Library/Carrier Bundles
+    // App bundle ownership repair still runs lazily. Carrier Bundles changes
+    // only through the verified 0777/0555 operations above.
 }
 
 static void scheduleExploitOnce(void) {
@@ -795,14 +851,11 @@ static BOOL systemVersionAtLeast(NSString *minimum) {
 __attribute__((constructor)) void TweakInit(void) {
     installHooks();
 
-    // Check if sandbox is already escaped
+    // This probe is informational. apfs_mod still needs kernel read/write.
     int fd = open("/var/mobile/.sbx_check", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
         close(fd); unlink("/var/mobile/.sbx_check");
-        g_sandbox_escaped = YES;
-        g_exploit_started = YES;
-        NSLog(@"[Tweak] Sandbox already escaped");
-        return;
+        NSLog(@"[Tweak] /var/mobile is writable; kernel access is still required for apfs_mod");
     }
 
     // Run exploit AFTER app finishes launching (UIKit must be ready for offsets_init
@@ -816,3 +869,4 @@ __attribute__((constructor)) void TweakInit(void) {
         scheduleExploitOnce();
     }];
 }
+
