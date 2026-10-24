@@ -11,6 +11,7 @@
 #include "kexploit/kutils.h"
 #include "sandbox_escape.h"
 #include "apfs_own.h"
+#include "TaskRop/RemoteCall.h"
 
 static const char *kCarrierBundlesPath = "/var/mobile/Library/Carrier Bundles";
 
@@ -631,6 +632,40 @@ static id hook_contentsOfDirectory(id self, SEL _cmd, id path, NSError **error) 
 
 static IMP orig_setAttributesOfItem = NULL;
 
+// LockIPCC stages the path in launchd and asks launchd to perform chmod.
+static BOOL g_launchd_remote_call_ready = NO;
+
+static BOOL remote_chmod_via_launchd(const char *path, mode_t mode) {
+    if (!path || !path[0]) return NO;
+
+    @synchronized([NSProcessInfo processInfo]) {
+        if (!g_launchd_remote_call_ready) {
+            NSLog(@"[CarrierBundles] initializing launchd RemoteCall");
+            if (init_remote_call("launchd", false) != 0 || !g_RC_trojanMem) {
+                NSLog(@"[CarrierBundles] launchd RemoteCall initialization failed");
+                return NO;
+            }
+            g_launchd_remote_call_ready = YES;
+        }
+
+        size_t length = strlen(path) + 1;
+        if (length > 0x1000 || !remote_write(g_RC_trojanMem, path, length)) {
+            NSLog(@"[CarrierBundles] could not stage path in launchd");
+            return NO;
+        }
+
+        uint64_t result = do_remote_call_stable(1000, "chmod",
+            g_RC_trojanMem, (uint64_t)(mode & 07777),
+            0, 0, 0, 0, 0, 0);
+        if ((int64_t)result != 0) {
+            NSLog(@"[CarrierBundles] launchd chmod failed for %s: result=%lld",
+                  path, (long long)result);
+            return NO;
+        }
+        return YES;
+    }
+}
+
 static void reportCarrierPermissionIfSaved(NSString *path, mode_t requestedMode) {
     if (![normalized_path(path) isEqualToString:kCarrierBundlesRoot]) return;
 
@@ -657,44 +692,23 @@ static BOOL hook_setAttributesOfItem(id self, SEL _cmd, id attributes, id path, 
 
     BOOL ok = orig_setAttributesOfItem ?
         ((BOOL(*)(id,SEL,id,id,NSError**))orig_setAttributesOfItem)(self, _cmd, attributes, path, error) : NO;
-    if (ok) {
-        if (isCarrierPermissionChange) {
-            reportCarrierPermissionIfSaved((NSString *)path, [permission unsignedShortValue]);
-        }
-        return YES;
-    }
-    if (!g_sandbox_escaped || !isCarrierPermissionChange) return ok;
+    if (!isCarrierPermissionChange || !g_sandbox_escaped) return ok;
 
     const char *cpath = [(NSString *)path fileSystemRepresentation];
     struct stat before;
     if (lstat(cpath, &before) != 0 || S_ISLNK(before.st_mode)) return ok;
 
-    if (apfs_own(cpath, 501, 501) != 0) {
-        NSLog(@"[CarrierBundles] could not take ownership before persistent chmod: %@", path);
-        return ok;
-    }
-
     mode_t targetPermissions = [permission unsignedShortValue] & 07777;
-    if (chmod(cpath, targetPermissions) != 0) {
-        NSLog(@"[CarrierBundles] persistent chmod failed for %@: %s", path, strerror(errno));
-        return ok;
-    }
-
-    int syncfd = open(cpath, O_RDONLY);
-    if (syncfd >= 0) {
-        fsync(syncfd);
-        close(syncfd);
-    }
-    sync();
+    if (!remote_chmod_via_launchd(cpath, targetPermissions)) return NO;
 
     struct stat after;
     if (stat(cpath, &after) != 0 || (after.st_mode & 07777) != targetPermissions) {
         NSLog(@"[CarrierBundles] persistent chmod verification failed: %@", path);
-        return ok;
+        return NO;
     }
 
     if (error) *error = nil;
-    NSLog(@"[CarrierBundles] saved permissions via persistent chmod: %@ -> 0%o",
+    NSLog(@"[CarrierBundles] saved permissions via launchd chmod: %@ -> 0%o",
           path, after.st_mode & 0xFFFF);
     reportCarrierPermissionIfSaved((NSString *)path, [permission unsignedShortValue]);
     return YES;

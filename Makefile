@@ -8,6 +8,9 @@ TWEAK_NAME = FilzaApplySandboxExt
 # --- Tweak + sandbox escape ---
 FilzaApplySandboxExt_FILES = Tweak.m sandbox_escape.m apfs_own.m
 
+# --- launchd RemoteCall for persistent chmod ---
+FilzaApplySandboxExt_FILES += TaskRop/RemoteCall.m TaskRop/Exception.m TaskRop/PAC.m TaskRop/Thread.m TaskRop/VM.m TaskRop/MigFilterBypassThread.m
+
 # --- kexploit ---
 FilzaApplySandboxExt_FILES += kexploit/kexploit_opa334.m kexploit/krw.m kexploit/kutils.m kexploit/offsets.m kexploit/vnode.m
 
@@ -40,3 +43,4 @@ FilzaApplySandboxExt_LIBRARIES = z sandbox
 FilzaApplySandboxExt_INSTALL_TARGET_PROCESSES = Filza
 
 include $(THEOS_MAKE_PATH)/tweak.mk
+
