@@ -871,10 +871,7 @@ __attribute__((constructor)) void TweakInit(void) {
     // which uses UIDevice.currentDevice.systemVersion)
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
         object:nil queue:nil usingBlock:^(NSNotification *note) {
-        if (systemVersionAtLeast(@"18.6")) {
-            NSLog(@"[Tweak] iOS 18.6+ detected; delaying kexploit until Carrier Bundles access");
-            return;
-        }
+        NSLog(@"[Tweak] app launched; starting original exploit flow");
         scheduleExploitOnce();
     }];
 }
