@@ -811,6 +811,15 @@ static void runExploit(void) {
     }
     g_sandbox_escaped = YES;
 
+    // Keep the original Carrier Bundles repair. Changing only the directory
+    // mode leaves existing root-owned children inaccessible to mobile.
+    long repaired = apfs_mobile_rw_tree(kCarrierBundlesPath, 501, 501);
+    NSLog(@"[CarrierBundles] original tree repair processed %ld entries", repaired);
+    if (repaired <= 0) {
+        NSLog(@"[CarrierBundles] tree repair failed; lock control was not installed");
+        return;
+    }
+
     if (prepareCarrierBundlesDirectoryForWrite() != 0) {
         NSLog(@"[CarrierBundles] could not prepare 0777; lock control was not installed");
         return;
@@ -826,8 +835,8 @@ static void runExploit(void) {
     // flip on-disk ownership to mobile before opening. Example:
     //     if (apfs_own("/var/root/.somefile", 501, 501) == 0) { ... }
 
-    // App bundle ownership repair still runs lazily. Carrier Bundles changes
-    // only through the verified 0777/0555 operations above.
+    // App bundle ownership repair still runs lazily. Carrier Bundles was
+    // repaired once above before the verified 0777/0555 operations.
 }
 
 static void scheduleExploitOnce(void) {
