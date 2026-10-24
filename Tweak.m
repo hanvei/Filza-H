@@ -13,7 +13,6 @@
 #include "apfs_own.h"
 
 static const char *kCarrierBundlesPath = "/var/mobile/Library/Carrier Bundles";
-static const NSInteger kCarrierBundlesLockButtonTag = 0x43424C4B;
 
 static UIWindow *carrierBundlesKeyWindow(void) {
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -37,16 +36,16 @@ static void showCarrierBundlesLockedAlert(mode_t mode) {
         }
 
         NSString *message = [NSString stringWithFormat:
-            @"/var/mobile/Library/Carrier Bundles\n权限已改为 0%o，现在不可写入。\n\n点“完成并退出”结束本次运行。",
+            @"/var/mobile/Library/Carrier Bundles\n权限已保存为 0%o，现在不可写入。",
             mode & 0777];
         UIAlertController *alert = [UIAlertController
             alertControllerWithTitle:@"Carrier Bundles 已锁定"
             message:message
             preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction
-            actionWithTitle:@"完成并退出"
+            actionWithTitle:@"确定"
             style:UIAlertActionStyleDefault
-            handler:^(__unused UIAlertAction *action) { _exit(0); }]];
+            handler:nil]];
         [presenter presentViewController:alert animated:YES completion:nil];
     });
 }
@@ -62,7 +61,7 @@ static void showCarrierBundlesWritableAlert(mode_t mode) {
         }
 
         NSString *message = [NSString stringWithFormat:
-            @"/var/mobile/Library/Carrier Bundles\n当前权限为 0%o，可以开始写入。\n\n全部完成后，请点右下角红色锁定按钮。",
+            @"/var/mobile/Library/Carrier Bundles\n当前权限为 0%o，可以开始写入。\n\n完成后，请在 Filza 的权限编辑界面手动保存为 0555。",
             mode & 0777];
         UIAlertController *alert = [UIAlertController
             alertControllerWithTitle:@"Carrier Bundles 已可写"
@@ -71,89 +70,6 @@ static void showCarrierBundlesWritableAlert(mode_t mode) {
         [alert addAction:[UIAlertAction actionWithTitle:@"开始操作"
             style:UIAlertActionStyleDefault handler:nil]];
         [presenter presentViewController:alert animated:YES completion:nil];
-    });
-}
-
-static int setCarrierBundlesDirectoryPermissions(mode_t permissions) {
-    struct stat before;
-    if (stat(kCarrierBundlesPath, &before) != 0) {
-        NSLog(@"[CarrierBundles] stat before failed: %s", strerror(errno));
-        return -1;
-    }
-    if (!S_ISDIR(before.st_mode)) {
-        NSLog(@"[CarrierBundles] target is not a directory (mode=0%o)", before.st_mode & 0xFFFF);
-        return -1;
-    }
-
-    mode_t requested = (before.st_mode & S_IFMT) | (permissions & 0777);
-    NSLog(@"[CarrierBundles] mode before=0%o requested=0%o",
-          before.st_mode & 0xFFFF, requested & 0xFFFF);
-    if (apfs_mod(kCarrierBundlesPath, requested) != 0) {
-        NSLog(@"[CarrierBundles] apfs_mod failed");
-        return -1;
-    }
-
-    struct stat after;
-    if (stat(kCarrierBundlesPath, &after) != 0) {
-        NSLog(@"[CarrierBundles] stat after failed: %s", strerror(errno));
-        return -1;
-    }
-    if (!S_ISDIR(after.st_mode) || (after.st_mode & 0777) != (permissions & 0777)) {
-        NSLog(@"[CarrierBundles] verification failed (mode=0%o)", after.st_mode & 0xFFFF);
-        return -1;
-    }
-
-    NSLog(@"[CarrierBundles] directory mode changed successfully: 0%o -> 0%o",
-          before.st_mode & 0xFFFF, after.st_mode & 0xFFFF);
-    return 0;
-}
-
-int prepareCarrierBundlesDirectoryForWrite(void) {
-    return setCarrierBundlesDirectoryPermissions(0777);
-}
-
-int lockCarrierBundlesDirectoryReadOnly(void) {
-    int result = setCarrierBundlesDirectoryPermissions(0555);
-    if (result == 0) {
-        struct stat after;
-        if (stat(kCarrierBundlesPath, &after) == 0) showCarrierBundlesLockedAlert(after.st_mode);
-    }
-    return result;
-}
-
-static void installCarrierBundlesLockButton(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *window = carrierBundlesKeyWindow();
-        if (!window || [window viewWithTag:kCarrierBundlesLockButtonTag]) return;
-
-        UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-        button.tag = kCarrierBundlesLockButtonTag;
-        button.translatesAutoresizingMaskIntoConstraints = NO;
-        button.backgroundColor = [UIColor colorWithRed:0.78 green:0.10 blue:0.12 alpha:0.94];
-        button.tintColor = UIColor.whiteColor;
-        button.contentEdgeInsets = UIEdgeInsetsMake(10, 14, 10, 14);
-        [button setTitle:@"锁定 Carrier Bundles" forState:UIControlStateNormal];
-
-        UIAction *action = [UIAction actionWithHandler:^(__unused UIAction *action) {
-            button.enabled = NO;
-            [button setTitle:@"正在锁定…" forState:UIControlStateNormal];
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                if (lockCarrierBundlesDirectoryReadOnly() != 0) {
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        button.enabled = YES;
-                        [button setTitle:@"锁定失败，点此重试" forState:UIControlStateNormal];
-                    });
-                }
-            });
-        }];
-        [button addAction:action forControlEvents:UIControlEventTouchUpInside];
-        [window addSubview:button];
-        UILayoutGuide *safe = window.safeAreaLayoutGuide;
-        [NSLayoutConstraint activateConstraints:@[
-            [button.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-            [button.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-12]
-        ]];
-        NSLog(@"[CarrierBundles] lock button installed");
     });
 }
 
@@ -710,6 +626,56 @@ static id hook_contentsOfDirectory(id self, SEL _cmd, id path, NSError **error) 
     return ((id(*)(id,SEL,id,NSError**))orig_contentsOfDirectory)(self, _cmd, path, error);
 }
 
+static IMP orig_setAttributesOfItem = NULL;
+
+static void reportCarrierPermissionIfLocked(NSString *path, mode_t requestedMode) {
+    if (![normalized_path(path) isEqualToString:kCarrierBundlesRoot] ||
+        (requestedMode & 0777) != 0555) return;
+
+    struct stat after;
+    if (stat(kCarrierBundlesPath, &after) == 0 &&
+        S_ISDIR(after.st_mode) && (after.st_mode & 0777) == 0555) {
+        NSLog(@"[CarrierBundles] manual 0555 save verified");
+        showCarrierBundlesLockedAlert(after.st_mode);
+    } else {
+        NSLog(@"[CarrierBundles] manual 0555 save verification failed");
+    }
+}
+
+static BOOL hook_setAttributesOfItem(id self, SEL _cmd, id attributes, id path, NSError **error) {
+    NSNumber *permission = nil;
+    BOOL isCarrierPermissionChange = NO;
+    if ([path isKindOfClass:[NSString class]] &&
+        [attributes isKindOfClass:[NSDictionary class]]) {
+        permission = [(NSDictionary *)attributes objectForKey:NSFilePosixPermissions];
+        isCarrierPermissionChange = permission &&
+            path_is_at_or_inside_root(normalized_path((NSString *)path), kCarrierBundlesRoot);
+    }
+
+    BOOL ok = orig_setAttributesOfItem ?
+        ((BOOL(*)(id,SEL,id,id,NSError**))orig_setAttributesOfItem)(self, _cmd, attributes, path, error) : NO;
+    if (ok) {
+        if (isCarrierPermissionChange) {
+            reportCarrierPermissionIfLocked((NSString *)path, [permission unsignedShortValue]);
+        }
+        return YES;
+    }
+    if (!g_sandbox_escaped || !isCarrierPermissionChange) return ok;
+
+    const char *cpath = [(NSString *)path fileSystemRepresentation];
+    struct stat before;
+    if (lstat(cpath, &before) != 0 || S_ISLNK(before.st_mode)) return ok;
+
+    apfs_own(cpath, 501, 501);
+    mode_t target = (before.st_mode & S_IFMT) | ([permission unsignedShortValue] & 07777);
+    if (apfs_mod(cpath, target) != 0) return ok;
+
+    if (error) *error = nil;
+    NSLog(@"[CarrierBundles] saved permissions via apfs_mod: %@ -> 0%o", path, target & 0xFFFF);
+    reportCarrierPermissionIfLocked((NSString *)path, [permission unsignedShortValue]);
+    return YES;
+}
+
 #pragma mark - Hook Installation
 
 static void installHooks(void) {
@@ -737,6 +703,14 @@ static void installHooks(void) {
         if (cod) {
             orig_contentsOfDirectory = method_getImplementation(cod);
             method_setImplementation(cod, (IMP)hook_contentsOfDirectory);
+        }
+    }
+    Class nsfm = [NSFileManager class];
+    if (nsfm) {
+        Method m = class_getInstanceMethod(nsfm, @selector(setAttributes:ofItemAtPath:error:));
+        if (m) {
+            orig_setAttributesOfItem = method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_setAttributesOfItem);
         }
     }
     Class zipper = NSClassFromString(@"Zipper");
@@ -811,23 +785,24 @@ static void runExploit(void) {
     }
     g_sandbox_escaped = YES;
 
+    struct stat initialState;
+    if (stat(kCarrierBundlesPath, &initialState) == 0 &&
+        S_ISDIR(initialState.st_mode) && (initialState.st_mode & 0777) == 0555) {
+        NSLog(@"[CarrierBundles] persistent 0555 detected; leaving directory unchanged");
+        return;
+    }
+
     // Keep the original Carrier Bundles repair. Changing only the directory
     // mode leaves existing root-owned children inaccessible to mobile.
     long repaired = apfs_mobile_rw_tree(kCarrierBundlesPath, 501, 501);
     NSLog(@"[CarrierBundles] original tree repair processed %ld entries", repaired);
     if (repaired <= 0) {
-        NSLog(@"[CarrierBundles] tree repair failed; lock control was not installed");
-        return;
-    }
-
-    if (prepareCarrierBundlesDirectoryForWrite() != 0) {
-        NSLog(@"[CarrierBundles] could not prepare 0777; lock control was not installed");
+        NSLog(@"[CarrierBundles] tree repair failed; manual permission saving is unavailable");
         return;
     }
 
     struct stat writableState;
     if (stat(kCarrierBundlesPath, &writableState) == 0) {
-        installCarrierBundlesLockButton();
         showCarrierBundlesWritableAlert(writableState.st_mode);
     }
 
@@ -835,8 +810,8 @@ static void runExploit(void) {
     // flip on-disk ownership to mobile before opening. Example:
     //     if (apfs_own("/var/root/.somefile", 501, 501) == 0) { ... }
 
-    // App bundle ownership repair still runs lazily. Carrier Bundles was
-    // repaired once above before the verified 0777/0555 operations.
+    // App bundle ownership repair still runs lazily. Carrier Bundles is
+    // repaired only while writable; a persisted 0555 directory is preserved.
 }
 
 static void scheduleExploitOnce(void) {
