@@ -635,17 +635,37 @@ static IMP orig_setAttributesOfItem = NULL;
 // LockIPCC stages the path in launchd and asks launchd to perform chmod.
 static BOOL g_launchd_remote_call_ready = NO;
 
+static BOOL initialize_launchd_remote_call(void) {
+    @synchronized([NSProcessInfo processInfo]) {
+        if (g_launchd_remote_call_ready && g_RC_trojanMem && g_RC_trojanMem != UINT64_MAX) {
+            return YES;
+        }
+        if (!g_sandbox_escaped) {
+            NSLog(@"[CarrierBundles] RemoteCall initialization skipped before sandbox escape");
+            return NO;
+        }
+
+        NSLog(@"[CarrierBundles] initializing launchd RemoteCall after exploit setup");
+        int result = init_remote_call("launchd", false);
+        if (result != 0 || !g_RC_trojanMem || g_RC_trojanMem == UINT64_MAX) {
+            NSLog(@"[CarrierBundles] launchd RemoteCall initialization failed safely: result=%d memory=0x%llx",
+                  result, (unsigned long long)g_RC_trojanMem);
+            return NO;
+        }
+
+        g_launchd_remote_call_ready = YES;
+        NSLog(@"[CarrierBundles] launchd RemoteCall ready");
+        return YES;
+    }
+}
+
 static BOOL remote_chmod_via_launchd(const char *path, mode_t mode) {
     if (!path || !path[0]) return NO;
 
     @synchronized([NSProcessInfo processInfo]) {
-        if (!g_launchd_remote_call_ready) {
-            NSLog(@"[CarrierBundles] initializing launchd RemoteCall");
-            if (init_remote_call("launchd", false) != 0 || !g_RC_trojanMem) {
-                NSLog(@"[CarrierBundles] launchd RemoteCall initialization failed");
-                return NO;
-            }
-            g_launchd_remote_call_ready = YES;
+        if (!g_launchd_remote_call_ready || !g_RC_trojanMem || g_RC_trojanMem == UINT64_MAX) {
+            NSLog(@"[CarrierBundles] chmod refused: launchd RemoteCall is not ready");
+            return NO;
         }
 
         size_t length = strlen(path) + 1;
@@ -822,6 +842,11 @@ static void runExploit(void) {
         return;
     }
     g_sandbox_escaped = YES;
+
+    // Establish and validate the reusable launchd context while the exploit
+    // setup is still in its controlled startup phase. Permission saves only
+    // reuse this context; they never initialize kernel-facing state.
+    initialize_launchd_remote_call();
 
     struct stat initialState;
     if (stat(kCarrierBundlesPath, &initialState) == 0 &&

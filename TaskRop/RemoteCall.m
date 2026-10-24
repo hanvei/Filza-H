@@ -513,10 +513,23 @@ uint64_t retry_first_thread(bool useMigFilterBypass) {
 
 // NOTE: Do not run this function while "attaching xcode" on iOS 18+, it will make device unstable.
 int init_remote_call(const char* process, bool useMigFilterBypass) {
-    
+    if (!process || process[0] == '\0') {
+        NSLog(@"[RemoteCall] refusing initialization without a process name");
+        return -1;
+    }
+
     uint64_t procAddr = proc_find_by_name(process);
+    if (!procAddr || procAddr == UINT64_MAX || !is_kaddr_valid(procAddr)) {
+        NSLog(@"[RemoteCall] refusing initialization: process not found or invalid (%s)", process);
+        return -1;
+    }
     printf("[%s:%d] process: %s, pid: %u\n",  __FUNCTION__, __LINE__, process, kread32(procAddr + off_proc_p_pid));
-    g_RC_taskAddr = proc_task(procAddr);
+    uint64_t targetTask = proc_task(procAddr);
+    if (!targetTask || targetTask == UINT64_MAX || !is_kaddr_valid(targetTask)) {
+        NSLog(@"[RemoteCall] refusing initialization: invalid target task for %s", process);
+        return -1;
+    }
+    g_RC_taskAddr = targetTask;
     
     mach_port_t firstExceptionPort = create_exception_port();
     mach_port_t secondExceptionPort = create_exception_port();
@@ -539,8 +552,22 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     EXC_GUARD_ENCODE_FLAVOR(guardCode, kGUARD_EXC_INVALID_RIGHT);
     EXC_GUARD_ENCODE_TARGET(guardCode, 0xf503ULL);  // ??? what is 0xf503 value meaning?
     
-    uint64_t firstPortAddr = task_get_ipc_port_kobject(task_self(), firstExceptionPort);
-    uint64_t secondPortAddr = task_get_ipc_port_kobject(task_self(), secondExceptionPort);
+    uint64_t selfTask = task_self();
+    if (!selfTask || selfTask == UINT64_MAX || !is_kaddr_valid(selfTask)) {
+        mach_port_destruct(mach_task_self_, firstExceptionPort, 0, 0);
+        mach_port_destruct(mach_task_self_, secondExceptionPort, 0, 0);
+        NSLog(@"[RemoteCall] refusing initialization: invalid self task");
+        return -1;
+    }
+    uint64_t firstPortAddr = task_get_ipc_port_kobject(selfTask, firstExceptionPort);
+    uint64_t secondPortAddr = task_get_ipc_port_kobject(selfTask, secondExceptionPort);
+    if (!firstPortAddr || firstPortAddr == UINT64_MAX || !is_kaddr_valid(firstPortAddr) ||
+        !secondPortAddr || secondPortAddr == UINT64_MAX || !is_kaddr_valid(secondPortAddr)) {
+        mach_port_destruct(mach_task_self_, firstExceptionPort, 0, 0);
+        mach_port_destruct(mach_task_self_, secondExceptionPort, 0, 0);
+        NSLog(@"[RemoteCall] refusing initialization: exception port objects are invalid");
+        return -1;
+    }
     
     pthread_t dummyThread = NULL;
     void *dummyFunc = dlsym(RTLD_DEFAULT, "getpid");
