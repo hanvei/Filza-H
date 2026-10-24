@@ -35,11 +35,14 @@ static void showCarrierBundlesLockedAlert(mode_t mode) {
             return;
         }
 
+        mode_t permissions = mode & 0777;
+        NSString *state = permissions == 0555 ? @"现在不可写入。" :
+            (permissions == 0777 ? @"现在可以写入。" : @"权限修改已经生效。");
         NSString *message = [NSString stringWithFormat:
-            @"/var/mobile/Library/Carrier Bundles\n权限已保存为 0%o，现在不可写入。",
-            mode & 0777];
+            @"/var/mobile/Library/Carrier Bundles\n权限已保存为 0%o，%@",
+            permissions, state];
         UIAlertController *alert = [UIAlertController
-            alertControllerWithTitle:@"Carrier Bundles 已锁定"
+            alertControllerWithTitle:@"Carrier Bundles 保存成功"
             message:message
             preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction
@@ -628,17 +631,17 @@ static id hook_contentsOfDirectory(id self, SEL _cmd, id path, NSError **error) 
 
 static IMP orig_setAttributesOfItem = NULL;
 
-static void reportCarrierPermissionIfLocked(NSString *path, mode_t requestedMode) {
-    if (![normalized_path(path) isEqualToString:kCarrierBundlesRoot] ||
-        (requestedMode & 0777) != 0555) return;
+static void reportCarrierPermissionIfSaved(NSString *path, mode_t requestedMode) {
+    if (![normalized_path(path) isEqualToString:kCarrierBundlesRoot]) return;
 
     struct stat after;
     if (stat(kCarrierBundlesPath, &after) == 0 &&
-        S_ISDIR(after.st_mode) && (after.st_mode & 0777) == 0555) {
-        NSLog(@"[CarrierBundles] manual 0555 save verified");
+        S_ISDIR(after.st_mode) &&
+        (after.st_mode & 07777) == (requestedMode & 07777)) {
+        NSLog(@"[CarrierBundles] manual permission save verified: 0%o", after.st_mode & 07777);
         showCarrierBundlesLockedAlert(after.st_mode);
     } else {
-        NSLog(@"[CarrierBundles] manual 0555 save verification failed");
+        NSLog(@"[CarrierBundles] manual permission save verification failed");
     }
 }
 
@@ -656,7 +659,7 @@ static BOOL hook_setAttributesOfItem(id self, SEL _cmd, id attributes, id path, 
         ((BOOL(*)(id,SEL,id,id,NSError**))orig_setAttributesOfItem)(self, _cmd, attributes, path, error) : NO;
     if (ok) {
         if (isCarrierPermissionChange) {
-            reportCarrierPermissionIfLocked((NSString *)path, [permission unsignedShortValue]);
+            reportCarrierPermissionIfSaved((NSString *)path, [permission unsignedShortValue]);
         }
         return YES;
     }
@@ -666,13 +669,34 @@ static BOOL hook_setAttributesOfItem(id self, SEL _cmd, id attributes, id path, 
     struct stat before;
     if (lstat(cpath, &before) != 0 || S_ISLNK(before.st_mode)) return ok;
 
-    apfs_own(cpath, 501, 501);
-    mode_t target = (before.st_mode & S_IFMT) | ([permission unsignedShortValue] & 07777);
-    if (apfs_mod(cpath, target) != 0) return ok;
+    if (apfs_own(cpath, 501, 501) != 0) {
+        NSLog(@"[CarrierBundles] could not take ownership before persistent chmod: %@", path);
+        return ok;
+    }
+
+    mode_t targetPermissions = [permission unsignedShortValue] & 07777;
+    if (chmod(cpath, targetPermissions) != 0) {
+        NSLog(@"[CarrierBundles] persistent chmod failed for %@: %s", path, strerror(errno));
+        return ok;
+    }
+
+    int syncfd = open(cpath, O_RDONLY);
+    if (syncfd >= 0) {
+        fsync(syncfd);
+        close(syncfd);
+    }
+    sync();
+
+    struct stat after;
+    if (stat(cpath, &after) != 0 || (after.st_mode & 07777) != targetPermissions) {
+        NSLog(@"[CarrierBundles] persistent chmod verification failed: %@", path);
+        return ok;
+    }
 
     if (error) *error = nil;
-    NSLog(@"[CarrierBundles] saved permissions via apfs_mod: %@ -> 0%o", path, target & 0xFFFF);
-    reportCarrierPermissionIfLocked((NSString *)path, [permission unsignedShortValue]);
+    NSLog(@"[CarrierBundles] saved permissions via persistent chmod: %@ -> 0%o",
+          path, after.st_mode & 0xFFFF);
+    reportCarrierPermissionIfSaved((NSString *)path, [permission unsignedShortValue]);
     return YES;
 }
 
