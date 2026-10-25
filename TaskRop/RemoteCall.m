@@ -559,6 +559,16 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         NSLog(@"[RemoteCall] refusing initialization: invalid self task");
         return -1;
     }
+    NSLog(@"[RCDiag] init version=%@ selfTask=0x%llx firstPort=0x%x secondPort=0x%x "
+          "itkSpace=0x%llx isTable=0x%llx entrySize=0x%llx entryObject=0x%llx portKobject=0x%llx",
+          [[UIDevice currentDevice] systemVersion], (unsigned long long)selfTask,
+          firstExceptionPort, secondExceptionPort,
+          (unsigned long long)off_task_itk_space,
+          (unsigned long long)off_ipc_space_is_table,
+          (unsigned long long)sizeof_ipc_entry,
+          (unsigned long long)off_ipc_entry_ie_object,
+          (unsigned long long)off_ipc_port_ip_kobject);
+
     uint64_t firstPortAddr = task_get_ipc_port_kobject(selfTask, firstExceptionPort);
     uint64_t secondPortAddr = task_get_ipc_port_kobject(selfTask, secondExceptionPort);
     if (!firstPortAddr || firstPortAddr == UINT64_MAX || !is_kaddr_valid(firstPortAddr) ||
