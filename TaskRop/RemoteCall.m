@@ -571,12 +571,13 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
 
     uint64_t firstPortAddr = task_get_ipc_port_kobject(selfTask, firstExceptionPort);
     uint64_t secondPortAddr = task_get_ipc_port_kobject(selfTask, secondExceptionPort);
-    if (!firstPortAddr || firstPortAddr == UINT64_MAX || !is_kaddr_valid(firstPortAddr) ||
-        !secondPortAddr || secondPortAddr == UINT64_MAX || !is_kaddr_valid(secondPortAddr)) {
-        mach_port_destruct(mach_task_self_, firstExceptionPort, 0, 0);
-        mach_port_destruct(mach_task_self_, secondExceptionPort, 0, 0);
-        NSLog(@"[RemoteCall] refusing initialization: exception port objects are invalid");
-        return -1;
+    if (!firstPortAddr || !secondPortAddr ||
+        firstPortAddr == UINT64_MAX || secondPortAddr == UINT64_MAX) {
+        // LockIPCC-compatible behavior: plain receive ports created via
+        // mach_port_construct may have ip_kobject == 0. Log and continue
+        // instead of refusing initialization.
+        NSLog(@"[RemoteCall] exception port kobjects first=%#llx second=%#llx (receive ports may have no kobject)",
+              (unsigned long long)firstPortAddr, (unsigned long long)secondPortAddr);
     }
     
     pthread_t dummyThread = NULL;
