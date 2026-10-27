@@ -513,6 +513,7 @@ uint64_t retry_first_thread(bool useMigFilterBypass) {
 
 // NOTE: Do not run this function while "attaching xcode" on iOS 18+, it will make device unstable.
 int init_remote_call(const char* process, bool useMigFilterBypass) {
+    NSLog(@"[RemoteCall][stage] init_remote_call entered for process=%s useMigFilterBypass=%d", process, useMigFilterBypass);
     if (!process || process[0] == '\0') {
         NSLog(@"[RemoteCall] refusing initialization without a process name");
         return -1;
@@ -530,6 +531,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         return -1;
     }
     g_RC_taskAddr = targetTask;
+    NSLog(@"[RemoteCall][stage] target task resolved proc=0x%llx task=0x%llx", (unsigned long long)procAddr, (unsigned long long)targetTask);
     
     mach_port_t firstExceptionPort = create_exception_port();
     mach_port_t secondExceptionPort = create_exception_port();
@@ -543,9 +545,11 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         mach_port_destruct(mach_task_self_, secondExceptionPort, 0, 0);
         return -1;
     }
+    NSLog(@"[RemoteCall][stage] exception ports created first=0x%x second=0x%x", firstExceptionPort, secondExceptionPort);
     
     // Make sure the task won't crash after we handle an exception
     disable_excguard_kill(g_RC_taskAddr);
+    NSLog(@"[RemoteCall][stage] disable_excguard_kill done");
     
     mach_exception_code_t guardCode = 0;
     EXC_GUARD_ENCODE_TYPE(guardCode, GUARD_TYPE_MACH_PORT);
@@ -579,6 +583,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         NSLog(@"[RemoteCall] exception port kobjects first=%#llx second=%#llx (receive ports may have no kobject)",
               (unsigned long long)firstPortAddr, (unsigned long long)secondPortAddr);
     }
+    NSLog(@"[RemoteCall][stage] exception port kobject guard passed (log-and-continue)");
     
     pthread_t dummyThread = NULL;
     void *dummyFunc = dlsym(RTLD_DEFAULT, "getpid");
@@ -611,6 +616,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     uint64_t currThread = firstThread;
     
     g_RC_trojanThreadAddr = firstThread;
+    NSLog(@"[RemoteCall][stage] trojan thread resolved addr=0x%llx", (unsigned long long)firstThread);
     
     if (useMigFilterBypass)
         mig_bypass_resume();
@@ -680,6 +686,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         }
         currThread = next;
     }
+    NSLog(@"[RemoteCall][stage] thread loop done valid=%d injected=%d", validThreadCount, successThreadCount);
     
     if(useMigFilterBypass)
         mig_bypass_pause();
@@ -701,21 +708,25 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     }
     
     memcpy(&g_RC_originalState, &exc.threadState, sizeof(arm_thread_state64_internal));
+    NSLog(@"[RemoteCall][stage] first exception received, originalState saved");
     
     for (NSNumber *thread in g_RC_threadList) {
         clear_guard_exception(thread.unsignedLongLongValue);
     }
     printf("[%s:%d] Finish clearing EXC_GUARD from all other threads...\n", __FUNCTION__, __LINE__);
+    NSLog(@"[RemoteCall][stage] EXC_GUARD cleared from all threads");
     
     ExceptionMessage exc2;
     int desiredTimeout = 1500;
     while (wait_exception(firstExceptionPort, &exc2, desiredTimeout, false)) {
         reply_with_state(&exc2, &exc2.threadState);
     }
+    NSLog(@"[RemoteCall][stage] residual exceptions drained");
     
     arm_thread_state64_internal newState = exc.threadState;
     sign_state(firstThread, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
     reply_with_state(&exc, &newState);
+    NSLog(@"[RemoteCall][stage] trojan thread state signed & replied (FAKE_PC_TROJAN_CREATOR)");
     
     uint64_t trojanMemTemp = ((uint64_t)exc.threadState.__sp & 0x7fffffffffULL) - 0x100ULL;
     printf("[%s:%d] trojanMemTemp: 0x%llx\n", __FUNCTION__, __LINE__, trojanMemTemp);
@@ -724,6 +735,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     uint64_t remoteCrashSigned = remote_pac(g_RC_trojanThreadAddr, FAKE_PC_TROJAN, 0);
     do_remote_call_temp(100, "getpid", 0, 0, 0, 0, 0, 0, 0, 0); // for testing
     do_remote_call_temp(100, "pthread_create_suspended_np", trojanMemTemp, 0, remoteCrashSigned, 0, 0, 0, 0, 0);
+    NSLog(@"[RemoteCall][stage] remote call temp: getpid + pthread_create_suspended_np done");
     
     printf("[%s:%d] trojanMemTemp: 0x%llx\n", __FUNCTION__, __LINE__, trojanMemTemp);
     uint64_t pthreadAddr    = remote_read64(trojanMemTemp);
@@ -731,6 +743,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     uint64_t callThreadPort = do_remote_call_temp(100, "pthread_mach_thread_np", pthreadAddr, 0, 0, 0, 0, 0, 0, 0);
     printf("[%s:%d] callThreadPort: 0x%llx\n", __FUNCTION__, __LINE__, callThreadPort);
     g_RC_callThreadAddr = task_get_ipc_port_kobject(g_RC_taskAddr, (mach_port_t)callThreadPort);
+    NSLog(@"[RemoteCall][stage] worker thread resolved addr=0x%llx", (unsigned long long)g_RC_callThreadAddr);
     
     if(useMigFilterBypass)
         mig_bypass_resume();
@@ -754,8 +767,10 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         mig_bypass_pause();
     
     printf("[%s:%d] All good! Resuming trojan thread...\n", __FUNCTION__, __LINE__);
+    NSLog(@"[RemoteCall][stage] exc port set on worker thread");
     
     uint64_t ret = do_remote_call_temp(100, "thread_resume", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
+    NSLog(@"[RemoteCall][stage] worker thread_resume ret=0x%llx", (unsigned long long)ret);
     if (ret != 0) {
         printf("[%s:%d] Couldn't resume new thread, falling back to original\n", __FUNCTION__, __LINE__);
         g_RC_creatingExtraThread = false;
@@ -766,6 +781,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         restore_trojan_thread(&g_RC_originalState);
     }
     printf("[%s:%d] Original thread restored\n", __FUNCTION__, __LINE__);
+    NSLog(@"[RemoteCall][stage] original trojan thread restored");
     
     g_RC_pid = (int)do_remote_call_stable(100, "getpid", 0, 0, 0, 0, 0, 0, 0, 0);
     printf("[%s:%d] Task pid: %d\n", __FUNCTION__, __LINE__, g_RC_pid);
@@ -773,9 +789,11 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     g_RC_trojanMem = do_remote_call_stable(1000, "mmap", 0, PAGE_SIZE, VM_PROT_READ | VM_PROT_WRITE, MAP_PRIVATE | MAP_ANON, (uint64_t)-1, 0, 0, 0);
     
     do_remote_call_stable(100, "memset", g_RC_trojanMem, 0, PAGE_SIZE, 0, 0, 0, 0, 0);
+    NSLog(@"[RemoteCall][stage] stable mmap+memset done trojanMem=0x%llx", (unsigned long long)g_RC_trojanMem);
     
     g_RC_success = true;
     printf("[%s:%d] Finished successfully\n", __FUNCTION__, __LINE__);
+    NSLog(@"[RemoteCall][stage] init_remote_call SUCCESS pid=%d", g_RC_pid);
     
     return 0;
 }
