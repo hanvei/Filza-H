@@ -867,6 +867,61 @@ static void installHooks(void) {
 
 #pragma mark - Exploit (silent, background)
 
+// Diagnostic probe. Runs the exact operations the user needs (create / delete /
+// chmod inside Carrier Bundles) and logs rc+errno for each, so one device run
+// tells us which kernel layer is refusing:
+//   EACCES(13) -> plain DAC (mode bits)      => need uid 0
+//   EPERM(1)   -> sandbox / data vault MACF  => need uid 0 + label
+//   EROFS(30)  -> read-only mount
+// Everything it creates is removed again, and the directory mode is never
+// changed (chmod is re-issued with the *current* mode).
+static void cw_probe(const char *tag) {
+    const char *dir = kCarrierBundlesPath;
+    NSLog(@"[PROBE][%s] uid=%u euid=%u gid=%u egid=%u",
+          tag, getuid(), geteuid(), getgid(), getegid());
+
+    struct stat st;
+    if (lstat(dir, &st) == 0) {
+        NSLog(@"[PROBE][%s] lstat dir mode=0%o uid=%u gid=%u flags=0x%x",
+              tag, (unsigned)(st.st_mode & 07777), st.st_uid, st.st_gid,
+              (unsigned)st.st_flags);
+    } else {
+        NSLog(@"[PROBE][%s] lstat dir failed errno=%d(%s)", tag, errno, strerror(errno));
+    }
+
+    const char *targets[2] = { "/var/mobile/Library", dir };
+    const char *names[2] = { "Library", "CarrierBundles" };
+    for (int i = 0; i < 2; i++) {
+        errno = 0;
+        int aw = access(targets[i], W_OK);
+        int awErr = errno;
+
+        char probePath[1200];
+        snprintf(probePath, sizeof(probePath), "%s/.cwp_%d", targets[i], (int)getpid());
+        errno = 0;
+        int fd = open(probePath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int crErr = errno;
+        int ur = -1, ulErr = 0;
+        if (fd >= 0) {
+            close(fd);
+            errno = 0;
+            ur = unlink(probePath);
+            ulErr = errno;
+        }
+        NSLog(@"[PROBE][%s] %s accessW=%d/errno%d create=%d/errno%d unlink=%d/errno%d",
+              tag, names[i], aw, awErr, fd, crErr, ur, ulErr);
+    }
+
+    // chmod with the current mode: exercises the VFS write path without
+    // actually changing the stored permission bits.
+    if (lstat(dir, &st) == 0) {
+        errno = 0;
+        int cr = chmod(dir, st.st_mode & 07777);
+        NSLog(@"[PROBE][%s] chmod(dir, 0%o)=%d errno=%d(%s)",
+              tag, (unsigned)(st.st_mode & 07777), cr, errno, strerror(errno));
+    }
+}
+
 static void runExploit(void) {
     NSLog(@"[Tweak] Running kexploit...");
     int kret = kexploit_opa334();
@@ -876,6 +931,8 @@ static void runExploit(void) {
     }
 
     NSLog(@"[Tweak] kexploit succeeded, escaping sandbox...");
+    cw_probe("before-escape");
+
     uint64_t self_proc_addr = proc_self();
     int sret = sandbox_escape(self_proc_addr);
     NSLog(@"[Tweak] sandbox_escape returned %d", sret);
@@ -884,6 +941,15 @@ static void runExploit(void) {
         return;
     }
     g_sandbox_escaped = YES;
+    cw_probe("after-escape");
+
+    // Become real uid 0. Without this the 0555 lock we apply also blocks our
+    // own writes (that was exactly the v4 behaviour: mode shows 0555 but the
+    // folder is unusable). Root bypasses the write bits, which is what makes
+    // "locked to 0555 yet still writable" possible.
+    int eret = sbx_elevate_self_uid0(self_proc_addr);
+    NSLog(@"[Tweak] root elevation returned %d (uid=%u)", eret, getuid());
+    cw_probe("after-root");
 
     // Establish and validate the reusable launchd context while the exploit
     // setup is still in its controlled startup phase. Permission saves only

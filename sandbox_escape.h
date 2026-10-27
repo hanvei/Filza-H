@@ -11,4 +11,9 @@ int sandbox_escape(uint64_t self_proc);
 // Fixes UNIX DAC (owner/mode) checks so chmod/chown/writes to root-owned
 int sandbox_elevate_to_root(uint64_t self_proc);
 
+// Elevate to uid=0 by rewriting our own ucred's posix_cred in place.
+// Safest form (no pointer swap, no reference-count damage); required so that
+// a directory locked to 0555 stays writable for us, like LockIPCC does.
+int sbx_elevate_self_uid0(uint64_t self_proc);
+
 #endif
