@@ -53,6 +53,55 @@ extern bool gIsPACSupported;
 #define BREAKPOINT_ENABLE 481
 #define BREAKPOINT_DISABLE 0
 
+// ---- persistent stage logger -------------------------------------------------
+// NSLog goes to syslog, which is lost when the device panics right after the
+// failing step. This logger appends to a file and fsync()s every line so the
+// last recorded step survives a reboot.
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+
+static int g_RCLogFd = -2; // -2 = not initialised yet, -1 = unavailable
+
+static void RCLogInit(void) {
+    if (g_RCLogFd != -2) return;
+    const char *paths[] = {
+        "/var/mobile/Library/Caches/filzarc_stage.log",
+        "/var/mobile/Library/Logs/filzarc_stage.log",
+        "/tmp/filzarc_stage.log",
+    };
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        int fd = open(paths[i], O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            g_RCLogFd = fd;
+            dprintf(fd, "=== filzarc stage log opened: %s ===\n", paths[i]);
+            fsync(fd);
+            return;
+        }
+    }
+    g_RCLogFd = -1;
+}
+
+void RCLog(const char *fmt, ...) {
+    RCLogInit();
+    if (g_RCLogFd < 0) return;
+    char buf[512];
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int n = snprintf(buf, sizeof(buf), "[%ld.%03ld] ", (long)ts.tv_sec, (long)(ts.tv_nsec / 1000000));
+    va_list ap;
+    va_start(ap, fmt);
+    n += vsnprintf(buf + n, sizeof(buf) - (size_t)n - 2, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;
+    buf[n++] = '\n';
+    write(g_RCLogFd, buf, (size_t)n);
+    fsync(g_RCLogFd);
+}
+
 uint64_t g_RC_taskAddr;
 bool g_RC_creatingExtraThread;
 mach_port_t g_RC_firstExceptionPort;
@@ -235,12 +284,17 @@ uint64_t do_remote_call_temp(int timeout, const char *name,
 {
     int newTimeout = (10000 > timeout) ? 10000 : timeout;
     uint64_t pcAddr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, name));
+    RCLog("[1] temp call start name=%s pcAddr=%#llx (waiting exception 1 on trojan thread)", name ? name : "(null)", (unsigned long long)pcAddr);
 
     ExceptionMessage exc;
     if (!wait_exception(g_RC_firstExceptionPort, &exc, newTimeout, false)) {
         printf("[%s:%d] Don't receive first exception on original thread\n", __FUNCTION__, __LINE__);
+        RCLog("[1-ERR] no first exception for %s", name ? name : "(null)");
         return 0;
     }
+    RCLog("[2] got exc1 for %s: pc=%#llx lr=%#llx sp=%#llx", name ? name : "(null)",
+          (unsigned long long)exc.threadState.__pc, (unsigned long long)exc.threadState.__lr,
+          (unsigned long long)exc.threadState.__sp);
 
     exc.threadState.__x[0] = x0;
     exc.threadState.__x[1] = x1;
@@ -251,7 +305,11 @@ uint64_t do_remote_call_temp(int timeout, const char *name,
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
     sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN_CREATOR);
+    RCLog("[3] signed state for %s: pc=%#llx lr=%#llx x0=%#llx x2=%#llx", name ? name : "(null)",
+          (unsigned long long)exc.threadState.__pc, (unsigned long long)exc.threadState.__lr,
+          (unsigned long long)exc.threadState.__x[0], (unsigned long long)exc.threadState.__x[2]);
     reply_with_state(&exc, &exc.threadState);
+    RCLog("[4] replied for %s (launchd thread now executing)", name ? name : "(null)");
 
     if (timeout < 0) {
         printf("[%s:%d] Trojan thread cleanup\n", __FUNCTION__, __LINE__);
@@ -261,10 +319,13 @@ uint64_t do_remote_call_temp(int timeout, const char *name,
     ExceptionMessage exc2;
     if (!wait_exception(g_RC_firstExceptionPort, &exc2, newTimeout, false)) {
         printf("[%s:%d] Don't receive second exception on original thread\n", __FUNCTION__, __LINE__);
+        RCLog("[4-ERR] no second exception for %s", name ? name : "(null)");
         return 0;
     }
     uint64_t retValue = exc2.threadState.__x[0];
+    RCLog("[5] got exc2 for %s: ret=%#llx", name ? name : "(null)", (unsigned long long)retValue);
     reply_with_state(&exc2, &exc2.threadState);
+    RCLog("[6] done %s", name ? name : "(null)");
     printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name, retValue, retValue);
     if(strcmp(name, "getpid") == 0 && retValue == 0) {
         printf("[%s:%d] getpid failed\n", __FUNCTION__, __LINE__);
@@ -514,6 +575,7 @@ uint64_t retry_first_thread(bool useMigFilterBypass) {
 // NOTE: Do not run this function while "attaching xcode" on iOS 18+, it will make device unstable.
 int init_remote_call(const char* process, bool useMigFilterBypass) {
     NSLog(@"[RemoteCall][stage] init_remote_call entered for process=%s useMigFilterBypass=%d", process, useMigFilterBypass);
+    RCLog("==== init_remote_call enter process=%s mig=%d ====", process ? process : "(null)", (int)useMigFilterBypass);
     if (!process || process[0] == '\0') {
         NSLog(@"[RemoteCall] refusing initialization without a process name");
         return -1;
@@ -725,17 +787,25 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     
     arm_thread_state64_internal newState = exc.threadState;
     sign_state(firstThread, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
+    RCLog("[S11] trojan creator state: pc=%#llx lr=%#llx sp=%#llx",
+          (unsigned long long)newState.__pc, (unsigned long long)newState.__lr, (unsigned long long)newState.__sp);
     reply_with_state(&exc, &newState);
     NSLog(@"[RemoteCall][stage] trojan thread state signed & replied (FAKE_PC_TROJAN_CREATOR)");
+    RCLog("[S11-OK] replied trojan creator redirect");
     
     uint64_t trojanMemTemp = ((uint64_t)exc.threadState.__sp & 0x7fffffffffULL) - 0x100ULL;
     printf("[%s:%d] trojanMemTemp: 0x%llx\n", __FUNCTION__, __LINE__, trojanMemTemp);
     g_RC_vmMap = task_get_vm_map(g_RC_taskAddr);
     
     uint64_t remoteCrashSigned = remote_pac(g_RC_trojanThreadAddr, FAKE_PC_TROJAN, 0);
+    RCLog("[S12] about to remote-call getpid (pcAddr=%#llx trojanMemTemp=%#llx remoteCrashSigned=%#llx)",
+          (unsigned long long)native_strip((uint64_t)dlsym(RTLD_DEFAULT, "getpid")),
+          (unsigned long long)trojanMemTemp, (unsigned long long)remoteCrashSigned);
     do_remote_call_temp(100, "getpid", 0, 0, 0, 0, 0, 0, 0, 0); // for testing
+    RCLog("[S12-OK] getpid returned, next pthread_create_suspended_np");
     do_remote_call_temp(100, "pthread_create_suspended_np", trojanMemTemp, 0, remoteCrashSigned, 0, 0, 0, 0, 0);
     NSLog(@"[RemoteCall][stage] remote call temp: getpid + pthread_create_suspended_np done");
+    RCLog("[S13-OK] pthread_create_suspended_np returned");
     
     printf("[%s:%d] trojanMemTemp: 0x%llx\n", __FUNCTION__, __LINE__, trojanMemTemp);
     uint64_t pthreadAddr    = remote_read64(trojanMemTemp);
@@ -794,6 +864,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     g_RC_success = true;
     printf("[%s:%d] Finished successfully\n", __FUNCTION__, __LINE__);
     NSLog(@"[RemoteCall][stage] init_remote_call SUCCESS pid=%d", g_RC_pid);
+    RCLog("==== init_remote_call SUCCESS pid=%d ====", g_RC_pid);
     
     return 0;
 }
