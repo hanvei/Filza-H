@@ -633,9 +633,23 @@ static id hook_contentsOfDirectory(id self, SEL _cmd, id path, NSError **error) 
 static IMP orig_setAttributesOfItem = NULL;
 
 // LockIPCC stages the path in launchd and asks launchd to perform chmod.
+//
+// Experiment switch: 0 = never hijack launchd in this build. The launchd
+// RemoteCall is what kills launchd (and reboots the device) on iOS 18.6/A18,
+// so we apply the permission change ourselves instead: first a real chmod()
+// syscall (Filza is root and unsandboxed after the escape), then a direct
+// apfs_fsnode.mode write through the kernel RW primitive.
+#define RC_ENABLE_LAUNCHD_CHMOD 0
+
 static BOOL g_launchd_remote_call_ready = NO;
 
+static BOOL remote_chmod_via_launchd(const char *path, mode_t mode);
+
 static BOOL initialize_launchd_remote_call(void) {
+#if !RC_ENABLE_LAUNCHD_CHMOD
+    NSLog(@"[CarrierBundles] launchd RemoteCall disabled in this build (direct chmod mode)");
+    return NO;
+#endif
     @synchronized([NSProcessInfo processInfo]) {
         if (g_launchd_remote_call_ready && g_RC_trojanMem && g_RC_trojanMem != UINT64_MAX) {
             return YES;
@@ -686,6 +700,34 @@ static BOOL remote_chmod_via_launchd(const char *path, mode_t mode) {
     }
 }
 
+// Apply a permission change without touching launchd.
+// Step 1: plain chmod() syscall. After sandbox_escape Filza runs as root with
+//         the sandbox torn down, so this may simply work (this is what makes
+//         the change persist through a reboot).
+// Step 2: fall back to writing apfs_fsnode.mode directly via the kernel RW
+//         primitive (works even when the VFS refuses, but is memory-only).
+static BOOL carrier_apply_permissions(const char *cpath, mode_t mode) {
+    errno = 0;
+    int rc = chmod(cpath, mode & 07777);
+    int chmodErrno = errno;
+    NSLog(@"[CarrierBundles] direct chmod: %s -> 0%o rc=%d errno=%d",
+          cpath, mode & 07777, rc, chmodErrno);
+    if (rc == 0) return YES;
+
+    errno = 0;
+    int arc = apfs_mod(cpath, mode & 07777);
+    int apfsErrno = errno;
+    NSLog(@"[CarrierBundles] apfs_mod fallback: %s -> 0%o rc=%d errno=%d",
+          cpath, mode & 07777, arc, apfsErrno);
+    if (arc == 0) return YES;
+
+#if RC_ENABLE_LAUNCHD_CHMOD
+    return remote_chmod_via_launchd(cpath, mode);
+#else
+    return NO;
+#endif
+}
+
 static void reportCarrierPermissionIfSaved(NSString *path, mode_t requestedMode) {
     if (![normalized_path(path) isEqualToString:kCarrierBundlesRoot]) return;
 
@@ -719,17 +761,17 @@ static BOOL hook_setAttributesOfItem(id self, SEL _cmd, id attributes, id path, 
     if (lstat(cpath, &before) != 0 || S_ISLNK(before.st_mode)) return ok;
 
     mode_t targetPermissions = [permission unsignedShortValue] & 07777;
-    if (!remote_chmod_via_launchd(cpath, targetPermissions)) return NO;
+    if (!carrier_apply_permissions(cpath, targetPermissions)) return NO;
 
     struct stat after;
     if (stat(cpath, &after) != 0 || (after.st_mode & 07777) != targetPermissions) {
-        NSLog(@"[CarrierBundles] persistent chmod verification failed: %@", path);
+        NSLog(@"[CarrierBundles] persistent chmod verification failed: %@ (got 0%o want 0%o)",
+              path, (unsigned)(after.st_mode & 07777), (unsigned)targetPermissions);
         return NO;
     }
 
     if (error) *error = nil;
-    NSLog(@"[CarrierBundles] saved permissions via launchd chmod: %@ -> 0%o",
-          path, after.st_mode & 0xFFFF);
+    NSLog(@"[CarrierBundles] saved permissions: %@ -> 0%o", path, after.st_mode & 0xFFFF);
     reportCarrierPermissionIfSaved((NSString *)path, [permission unsignedShortValue]);
     return YES;
 }
