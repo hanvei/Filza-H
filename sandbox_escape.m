@@ -172,6 +172,73 @@ static void set_rw_class(uint64_t hdr) {
     early_kwrite32bytes(hdr, hb);
 }
 
+#pragma mark - Structure dump (diagnostics)
+
+// The ext/header offsets used above were inherited from another iOS version and
+// were never verified on 18.6/A18. Dump the real objects so the layout can be
+// read off the device instead of guessed.
+static void sbx_dump_block(const char *tag, uint64_t addr, size_t len) {
+    if (!is_kaddr_valid(addr)) {
+        NSLog(@"[SBXDUMP] %s: skipped, invalid address 0x%llx", tag, addr);
+        return;
+    }
+    uint8_t blk[0x20];
+    for (size_t off = 0; off < len; off += 0x20) {
+        kreadbuf(addr + off, blk, sizeof(blk));
+        uint64_t w[4];
+        memcpy(w, blk, sizeof(w));
+        NSLog(@"[SBXDUMP] %s+0x%02zx: %016llx %016llx %016llx %016llx",
+              tag, off,
+              (unsigned long long)w[0], (unsigned long long)w[1],
+              (unsigned long long)w[2], (unsigned long long)w[3]);
+    }
+}
+
+void sbx_dump_state(uint64_t self_proc, const char *tag) {
+    if (!self_proc) return;
+
+    uint64_t proc_ro = read_proc_ro(self_proc);
+    uint32_t slot = 0;
+    uint64_t ucred = find_ucred_in_proc_ro(proc_ro, NULL, NULL, &slot);
+    if (!K(ucred)) { NSLog(@"[SBXDUMP][%s] ucred not found", tag); return; }
+
+    uint32_t label_off = off_ucred_cr_label ? off_ucred_cr_label : OFF_UCRED_CR_LABEL;
+    uint64_t label = S(early_kread64(ucred + label_off));
+    uint64_t sandbox = K(label) ? S(early_kread64(label + OFF_LABEL_SANDBOX)) : 0;
+    uint64_t ext_set = K(sandbox) ? S(early_kread64(sandbox + OFF_SANDBOX_EXT_SET)) : 0;
+
+    NSLog(@"[SBXDUMP][%s] proc=0x%llx proc_ro=0x%llx ucred=0x%llx(slot 0x%x) "
+          @"label=0x%llx sandbox=0x%llx ext_set=0x%llx",
+          tag, self_proc, proc_ro, ucred, slot, label, sandbox, ext_set);
+
+    if (!K(label)) return;
+    sbx_dump_block("label", label, 0x60);
+    if (K(sandbox)) sbx_dump_block("sandbox", sandbox, 0x80);
+    if (!K(ext_set)) return;
+    sbx_dump_block("ext_set", ext_set, 0x80);
+
+    int shown = 0;
+    for (int s = 0; s < 16 && shown < 4; s++) {
+        uint64_t hdr = S(early_kread64(ext_set + s * 8));
+        if (!K(hdr)) continue;
+
+        NSLog(@"[SBXDUMP][%s] slot %d -> header 0x%llx", tag, s, hdr);
+        sbx_dump_block("hdr", hdr, 0x40);
+
+        uint64_t ext = S(early_kread64(hdr + 0x8));
+        if (K(ext)) {
+            NSLog(@"[SBXDUMP][%s]   ext 0x%llx", tag, ext);
+            sbx_dump_block("ext", ext, 0x80);
+            uint64_t da = early_kread64(ext + OFF_EXT_DATA);
+            if (K(da)) {
+                NSLog(@"[SBXDUMP][%s]   extdata 0x%llx", tag, da);
+                sbx_dump_block("extdata", da, 0x40);
+            }
+        }
+        shown++;
+    }
+}
+
 #pragma mark - Main entry
 
 int sandbox_escape(uint64_t self_proc) {

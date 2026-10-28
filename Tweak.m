@@ -972,6 +972,16 @@ static void runExploit(void) {
     cw_probe("before-escape");
 
     uint64_t self_proc_addr = proc_self();
+
+    // The extension offsets inherited from another iOS build were never
+    // verified here, and the old "SANDBOX ESCAPED" proof point was a false
+    // positive (it tested a path the container already allows). Dump the real
+    // objects so the layout can be read off this device.
+#define RC_DUMP_SANDBOX 1
+#if RC_DUMP_SANDBOX
+    sbx_dump_state(self_proc_addr, "before");
+#endif
+
     int sret = sandbox_escape(self_proc_addr);
     NSLog(@"[Tweak] sandbox_escape returned %d", sret);
     if (sret != 0) {
@@ -979,6 +989,10 @@ static void runExploit(void) {
         return;
     }
     g_sandbox_escaped = YES;
+
+#if RC_DUMP_SANDBOX
+    sbx_dump_state(self_proc_addr, "after");
+#endif
     cw_probe("after-escape");
 
     // Experience switch: elevating the whole process to uid 0 breaks Filza's
