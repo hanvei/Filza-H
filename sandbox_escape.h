@@ -20,4 +20,18 @@ int sbx_elevate_self_uid0(uint64_t self_proc);
 // Diagnostics only: reads kernel memory, never writes.
 void sbx_dump_state(uint64_t self_proc, const char *tag);
 
+// Transplant launchd's MAC label slots into our own label:
+//   out_prev[0] receives our old AMFI slot, out_prev[1] our old sandbox object.
+// l_perpolicy[0] is the AMFI slot (entitlements), l_perpolicy[1] the sandbox.
+// Needed because Carrier Bundles returns EPERM while being 0755 owned by uid
+// 501 - the refusal sits in the MAC layer, above DAC and above the extension
+// table. Call this from the save path only, never at startup.
+// adopt_sandbox != 0 also replaces the sandbox object (removes profile rules).
+// Returns 0 when the AMFI slot was written.
+int sbx_adopt_launchd_privileges(uint64_t self_proc, int adopt_sandbox,
+                                 uint64_t out_prev[2]);
+
+// Restore the slots captured by sbx_adopt_launchd_privileges().
+void sbx_restore_label_slots(uint64_t self_proc, const uint64_t prev[2]);
+
 #endif
