@@ -4,6 +4,7 @@
 #import <xpc/xpc.h>
 #include <errno.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -752,28 +753,48 @@ static BOOL hook_setAttributesOfItem(id self, SEL _cmd, id attributes, id path, 
             path_is_at_or_inside_root(normalized_path((NSString *)path), kCarrierBundlesRoot);
     }
 
-    BOOL ok = orig_setAttributesOfItem ?
-        ((BOOL(*)(id,SEL,id,id,NSError**))orig_setAttributesOfItem)(self, _cmd, attributes, path, error) : NO;
-    if (!isCarrierPermissionChange || !g_sandbox_escaped) return ok;
+    // For Carrier Bundles permission saves we take ownership of the call.
+    // Calling the original implementation first is what made Filza surface
+    // "no permission": its chmod failed, it recorded the error, and only then
+    // did we patch the mode through the kernel, leaving the UI convinced the
+    // save had failed even though stat already reported the new mode.
+    if (isCarrierPermissionChange && g_sandbox_escaped &&
+        [path isKindOfClass:[NSString class]]) {
+        const char *cpath = [(NSString *)path fileSystemRepresentation];
+        struct stat before;
+        if (lstat(cpath, &before) == 0 && !S_ISLNK(before.st_mode)) {
+            mode_t targetPermissions = [permission unsignedShortValue] & 07777;
+            NSLog(@"[CarrierBundles] permission save intercepted: %@ 0%o -> 0%o",
+                  path, (unsigned)(before.st_mode & 07777), (unsigned)targetPermissions);
 
-    const char *cpath = [(NSString *)path fileSystemRepresentation];
-    struct stat before;
-    if (lstat(cpath, &before) != 0 || S_ISLNK(before.st_mode)) return ok;
-
-    mode_t targetPermissions = [permission unsignedShortValue] & 07777;
-    if (!carrier_apply_permissions(cpath, targetPermissions)) return NO;
-
-    struct stat after;
-    if (stat(cpath, &after) != 0 || (after.st_mode & 07777) != targetPermissions) {
-        NSLog(@"[CarrierBundles] persistent chmod verification failed: %@ (got 0%o want 0%o)",
-              path, (unsigned)(after.st_mode & 07777), (unsigned)targetPermissions);
-        return NO;
+            if (carrier_apply_permissions(cpath, targetPermissions)) {
+                struct stat after;
+                if (stat(cpath, &after) == 0 &&
+                    (after.st_mode & 07777) == targetPermissions) {
+                    if (error) *error = nil;
+                    NSLog(@"[CarrierBundles] saved permissions: %@ -> 0%o",
+                          path, (unsigned)(after.st_mode & 07777));
+                    reportCarrierPermissionIfSaved((NSString *)path, [permission unsignedShortValue]);
+                    return YES;
+                }
+                NSLog(@"[CarrierBundles] verify failed after apply: %@ got 0%o want 0%o",
+                      path, (unsigned)(after.st_mode & 07777), (unsigned)targetPermissions);
+            } else {
+                NSLog(@"[CarrierBundles] apply failed for %@; deferring to original implementation",
+                      path);
+            }
+        } else {
+            NSLog(@"[CarrierBundles] intercepted save but lstat failed for %@ (errno=%d), deferring",
+                  path, errno);
+        }
     }
 
-    if (error) *error = nil;
-    NSLog(@"[CarrierBundles] saved permissions: %@ -> 0%o", path, after.st_mode & 0xFFFF);
-    reportCarrierPermissionIfSaved((NSString *)path, [permission unsignedShortValue]);
-    return YES;
+    BOOL ok = orig_setAttributesOfItem ?
+        ((BOOL(*)(id,SEL,id,id,NSError**))orig_setAttributesOfItem)(self, _cmd, attributes, path, error) : NO;
+    if (isCarrierPermissionChange) {
+        NSLog(@"[CarrierBundles] fell back to original setAttributes for %@ -> %d", path, ok);
+    }
+    return ok;
 }
 
 #pragma mark - Hook Installation
@@ -891,6 +912,23 @@ static void cw_probe(const char *tag) {
 
     const char *targets[2] = { "/var/mobile/Library", dir };
     const char *names[2] = { "Library", "CarrierBundles" };
+
+    // Baseline check: this is what "能访问系统文件" actually means. If opendir
+    // stops working here, the exploit itself regressed, not the permission code.
+    for (int i = 0; i < 2; i++) {
+        DIR *d = opendir(targets[i]);
+        int cnt = -1, dErr = 0;
+        if (d) {
+            cnt = 0;
+            while (readdir(d) != NULL) cnt++;
+            closedir(d);
+        } else {
+            dErr = errno;
+        }
+        NSLog(@"[PROBE][%s] opendir(%s) entries=%d errno=%d",
+              tag, names[i], cnt, dErr);
+    }
+
     for (int i = 0; i < 2; i++) {
         errno = 0;
         int aw = access(targets[i], W_OK);
@@ -943,13 +981,20 @@ static void runExploit(void) {
     g_sandbox_escaped = YES;
     cw_probe("after-escape");
 
-    // Become real uid 0. Without this the 0555 lock we apply also blocks our
-    // own writes (that was exactly the v4 behaviour: mode shows 0555 but the
-    // folder is unusable). Root bypasses the write bits, which is what makes
-    // "locked to 0555 yet still writable" possible.
+    // Experience switch: elevating the whole process to uid 0 breaks Filza's
+    // own baseline (it stops browsing system paths and loses the sandbox
+    // escape it just performed), so it is OFF by default. Keep the code around
+    // for the "locked to 0555 but still writable" mode, but never enable it
+    // without also proving that baseline browsing still works afterwards.
+#define RC_ENABLE_ROOT_ELEVATION 0
+#if RC_ENABLE_ROOT_ELEVATION
     int eret = sbx_elevate_self_uid0(self_proc_addr);
     NSLog(@"[Tweak] root elevation returned %d (uid=%u)", eret, getuid());
     cw_probe("after-root");
+#else
+    NSLog(@"[Tweak] root elevation disabled in this build (baseline-safe mode); uid=%u",
+          getuid());
+#endif
 
     // Establish and validate the reusable launchd context while the exploit
     // setup is still in its controlled startup phase. Permission saves only
@@ -957,11 +1002,15 @@ static void runExploit(void) {
     initialize_launchd_remote_call();
 
     struct stat initialState;
-    if (stat(kCarrierBundlesPath, &initialState) == 0 &&
-        S_ISDIR(initialState.st_mode) && (initialState.st_mode & 0777) == 0555) {
-        NSLog(@"[CarrierBundles] persistent 0555 detected; leaving directory unchanged");
-        return;
+    if (stat(kCarrierBundlesPath, &initialState) == 0 && S_ISDIR(initialState.st_mode)) {
+        NSLog(@"[CarrierBundles] initial dir mode=0%o uid=%u gid=%u",
+              (unsigned)(initialState.st_mode & 07777),
+              initialState.st_uid, initialState.st_gid);
     }
+    // NOTE: no early return for a "persisted 0555" any more. That shortcut is
+    // what left the folder permanently read-only for our own uid=501 process:
+    // the first 0555 save skipped the repair on every later launch, so the
+    // folder could never be written to again.
 
     // Keep the original Carrier Bundles repair. Changing only the directory
     // mode leaves existing root-owned children inaccessible to mobile.
