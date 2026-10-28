@@ -6,6 +6,8 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include "kexploit/kexploit_opa334.h"
@@ -896,6 +898,8 @@ static void installHooks(void) {
 //   EROFS(30)  -> read-only mount
 // Everything it creates is removed again, and the directory mode is never
 // changed (chmod is re-issued with the *current* mode).
+static void cw_probe_matrix(const char *tag);
+
 static void cw_probe(const char *tag) {
     const char *dir = kCarrierBundlesPath;
     NSLog(@"[PROBE][%s] uid=%u euid=%u gid=%u egid=%u",
@@ -957,6 +961,71 @@ static void cw_probe(const char *tag) {
         int cr = chmod(dir, st.st_mode & 07777);
         NSLog(@"[PROBE][%s] chmod(dir, 0%o)=%d errno=%d(%s)",
               tag, (unsigned)(st.st_mode & 07777), cr, errno, strerror(errno));
+    }
+
+    cw_probe_matrix(tag);
+}
+
+// One path alone cannot distinguish "the sandbox is still closed" from "this
+// particular directory is protected by something else". After the earlier run
+// showed create() succeeding in /var/mobile/Library but failing in
+// /var/mobile/Library/Carrier Bundles, the matrix below writes and removes one
+// file in each of several directories and prints dev / mount flags / rootless
+// xattr / errno per attempt, so the refusing layer is identified by comparison:
+//   every child of Library fails  -> the extension is not inherited by children
+//   only Carrier Bundles fails    -> path-level protection (data vault, special
+//                                    inode, or a separate mount)
+//   st_dev differs from siblings  -> it is a separate mount / firmlink
+static void cw_probe_matrix(const char *tag) {
+    static const struct { const char *name; const char *path; } items[] = {
+        { "Library",         "/private/var/mobile/Library" },
+        { "Lib/Caches",      "/private/var/mobile/Library/Caches" },
+        { "Lib/Preferences", "/private/var/mobile/Library/Preferences" },
+        { "Lib/SMS",         "/private/var/mobile/Library/SMS" },
+        { "Lib/Keyboard",    "/private/var/mobile/Library/Keyboard" },
+        { "CarrierBundles",  "/private/var/mobile/Library/Carrier Bundles" },
+        { "Media",           "/private/var/mobile/Media" },
+        { "Documents",       "/private/var/mobile/Documents" },
+    };
+
+    for (size_t i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
+        struct stat st;
+        if (lstat(items[i].path, &st) != 0) {
+            NSLog(@"[PROBE][%s] MATRIX %-15s lstat failed errno=%d(%s)",
+                  tag, items[i].name, errno, strerror(errno));
+            continue;
+        }
+
+        char rootless[64];
+        memset(rootless, 0, sizeof(rootless));
+        errno = 0;
+        ssize_t xlen = getxattr(items[i].path, "com.apple.rootless",
+                                rootless, sizeof(rootless) - 1, 0, 0);
+        int xerr = errno;
+
+        struct statfs sf;
+        memset(&sf, 0, sizeof(sf));
+        int haveFs = (statfs(items[i].path, &sf) == 0);
+
+        char probe[1200];
+        snprintf(probe, sizeof(probe), "%s/.cwp_%d", items[i].path, (int)getpid());
+        errno = 0;
+        int fd = open(probe, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int cerr = errno;
+        int ur = -1, uerr = 0;
+        if (fd >= 0) {
+            close(fd);
+            errno = 0;
+            ur = unlink(probe);
+            uerr = errno;
+        }
+
+        NSLog(@"[PROBE][%s] MATRIX %-15s mode=0%o uid=%u gid=%u dev=0x%llx flags=0x%x "
+              "xattr=%ld/%d create=%d/%d unlink=%d/%d fs=%s mnt=0x%x",
+              tag, items[i].name, (unsigned)(st.st_mode & 07777),
+              st.st_uid, st.st_gid, (unsigned long long)st.st_dev,
+              (unsigned)st.st_flags, (long)xlen, xerr, fd, cerr, ur, uerr,
+              haveFs ? sf.f_fstypename : "?", haveFs ? (unsigned)sf.f_flags : 0);
     }
 }
 

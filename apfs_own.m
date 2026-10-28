@@ -418,28 +418,42 @@ int apfs_mod(const char *path, mode_t mode) {
         return -1;
     }
 
+    // APFS keeps the full st_mode (S_IFDIR / S_IFREG included) in this 16-bit
+    // field, while apfs_mod() is called with permission bits only. Writing the
+    // permission bits verbatim therefore clears the type bits: stat still looks
+    // right while the vnode is cached, but the inode is corrupt and any later
+    // vnode re-read (cache eviction, reboot) turns the entry type-less.
+    // The previous code also compared st_mode & 0xFFFF against the bare
+    // permission bits, so verification could never succeed (got 040555,
+    // expected 0555) even though the write had landed - that is what produced
+    // "shows 0555 but the save reports no permission".
+    uint64_t off = offsetof(struct apfs_fsnode, mode);
+    uint16_t cur = kread16(fs_node + off);
+    uint16_t perms = (uint16_t)(mode & 07777);
+    uint16_t target = (uint16_t)((cur & ~07777) | perms);
+
     struct stat st_before;
     if (stat(path, &st_before) == 0) {
-        uint16_t kmode = kread16(fs_node + offsetof(struct apfs_fsnode, mode));
-        if (kmode != (st_before.st_mode & 0xFFFF)) {
+        if ((st_before.st_mode & 07777) != (cur & 07777)) {
             NSLog(@"[APFS] mod: layout mismatch for %s (stat mode=0%o, kernel=0%o); aborting",
-                  path, st_before.st_mode & 0xFFFF, kmode);
+                  path, (unsigned)(st_before.st_mode & 07777), (unsigned)(cur & 07777));
             return -1;
         }
     }
 
-    kwrite16(fs_node + offsetof(struct apfs_fsnode, mode), (uint16_t)mode);
+    kwrite16(fs_node + off, target);
 
     sync(); sync(); sync();
 
     struct stat st;
     if (stat(path, &st) != 0) return -1;
-    if ((st.st_mode & 0xFFFF) != (mode & 0xFFFF)) {
+    if ((st.st_mode & 07777) != perms) {
         NSLog(@"[APFS] mod: verify failed (got 0%o, expected 0%o): %s",
-              st.st_mode & 0xFFFF, mode, path);
+              (unsigned)(st.st_mode & 07777), (unsigned)perms, path);
         return -1;
     }
 
-    NSLog(@"[APFS] mod: %s -> 0%o", path, mode);
+    NSLog(@"[APFS] mod: %s -> 0%o (type bits kept 0%o)", path, (unsigned)perms,
+          (unsigned)(target & ~07777));
     return 0;
 }
